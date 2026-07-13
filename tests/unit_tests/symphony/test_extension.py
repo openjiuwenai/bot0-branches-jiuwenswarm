@@ -11,6 +11,7 @@ from jiuwenswarm.extensions.symphony.extension import (
     SymphonyExtension,
     _BuildProcessLogger,
     _build_log_payload,
+    _build_presentation,
     _latest_effective_build_log_entry,
 )
 from jiuwenswarm.common.schema.agent import AgentRequest
@@ -369,6 +370,7 @@ def test_plan_presentation_uses_recommended_plan(monkeypatch, tmp_path):
     assert "Status:" not in result["content"]
     assert result["result"]["recommended_plans"][0]["status"] == "ready"
     assert "Best match." in result["content"]
+    assert result["content"].endswith("是否按照上述编排结果执行？")
     assert "Missing inputs:" not in result["content"]
     assert "收件邮箱地址" not in result["content"]
     assert "imap-smtp-email" not in result["content"]
@@ -388,6 +390,49 @@ def test_plan_presentation_uses_recommended_plan(monkeypatch, tmp_path):
     assert "N1 --> N2" in result["mermaid"]
     assert "-->|" not in result["mermaid"]
     assert "0.91" not in result["mermaid"]
+
+
+def test_plan_presentation_does_not_ask_to_execute_empty_plan():
+    presentation = _build_presentation(
+        {
+            "recommended_plans": [
+                {"title": "Empty Plan", "status": "ready", "steps": []}
+            ]
+        }
+    )
+
+    assert "是否按照上述编排结果执行？" not in presentation["markdown"]
+
+
+def test_plan_presentation_asks_to_execute_in_english():
+    presentation = _build_presentation(
+        {
+            "recommended_plans": [
+                {
+                    "title": "Recommended Plan",
+                    "status": "ready",
+                    "steps": [{"skill_id": "skill-1"}],
+                }
+            ]
+        },
+        language="en",
+    )
+
+    assert presentation["markdown"].endswith(
+        "Would you like to proceed with the orchestration plan above?"
+    )
+
+
+def test_plan_presentation_does_not_ask_to_execute_no_plan():
+    presentation = _build_presentation(
+        {
+            "recommended_plans": [
+                {"title": "No Plan", "status": "no_plan", "steps": []}
+            ]
+        }
+    )
+
+    assert "是否按照上述编排结果执行？" not in presentation["markdown"]
 
 
 def test_build_score_awaits_service_and_records_build_log(monkeypatch, tmp_path):
