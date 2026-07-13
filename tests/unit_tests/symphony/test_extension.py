@@ -2,6 +2,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from jiuwenswarm.extensions.symphony.extension import (
     SYMPHONY_BUILD_SCORE,
     SYMPHONY_GRAPH,
@@ -19,6 +21,14 @@ from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.extensions.registry import ExtensionRegistry
 from jiuwenswarm.symphony.config import symphony_config_from_dict
 from jiuwenswarm.symphony.orchestration.artifacts import ScoreArtifacts
+
+
+@pytest.fixture(autouse=True)
+def _use_chinese_preferred_language(monkeypatch):
+    monkeypatch.setattr(
+        "jiuwenswarm.extensions.symphony.extension.get_config",
+        lambda: {"preferred_language": "zh"},
+    )
 
 
 class _Registry:
