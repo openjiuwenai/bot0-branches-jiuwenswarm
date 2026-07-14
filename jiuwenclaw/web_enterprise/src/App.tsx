@@ -6,6 +6,7 @@
 
 import { useState, useCallback, useEffect, useRef, Component, ReactNode } from 'react';
 import { ChatPanel } from './components/ChatPanel';
+import { HistoryPanel } from './components/HistoryPanel';
 import { SessionSidebar } from './components/SessionSidebar';
 import { ToolPanel } from './components/ToolPanel';
 import { StatusBar } from './components/StatusBar';
@@ -40,7 +41,7 @@ import i18n from './i18n';
 import { getProductName } from './utils/env';
 import './App.css';
 
-type MainNavKey = 'chat';
+type MainNavKey = 'chat' | 'history';
 
 // 错误边界组件
 interface ErrorBoundaryState {
@@ -1097,6 +1098,11 @@ function AppContent() {
           </div>
         )}
 
+        {activeNav === 'history' && (
+          <div className="app-section">
+            <HistoryPanel />
+          </div>
+        )}
         {activeNav === 'chat' && (
           <>
             <div className="flex-1 flex min-h-0 overflow-hidden">
