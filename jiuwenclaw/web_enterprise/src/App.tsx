@@ -263,6 +263,14 @@ function AppContent() {
   } | null>(null);
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
   const [dbSessions, setDbSessions] = useState<HistorySession[]>([]);
+  const [currentUser, setCurrentUser] = useState<string>(() => {
+    try {
+      return localStorage.getItem('history_user') || 'guest';
+    } catch {
+      return 'guest';
+    }
+  });
+  const [userInput, setUserInput] = useState('');
   const sessionIdRef = useRef(sessionId);
   const historyRestoreHandleRef = useRef<HistoryRestoreHandle | null>(null);
   const historyPageHandleRef = useRef<HistoryRestoreHandle | null>(null);
@@ -763,15 +771,34 @@ function AppContent() {
   // 新建会话：立即生成可用的 session_id，避免停留在 'new' 导致无法发送消息
   const loadDbSessions = useCallback(async () => {
     try {
-      setDbSessions(await fetchDbSessions());
+      setDbSessions(await fetchDbSessions(50, 0, currentUser || undefined));
     } catch (e) {
       console.error('loadDbSessions failed', e);
     }
-  }, []);
+  }, [currentUser]);
 
   useEffect(() => {
     void loadDbSessions();
   }, [loadDbSessions]);
+
+  const switchUser = useCallback(
+    (name: string) => {
+      const u = name.trim() || 'guest';
+      try {
+        localStorage.setItem('history_user', u);
+      } catch {
+        // ignore storage error
+      }
+      setCurrentUser(u);
+      setUserInput('');
+      restoreRequestedRef.current = false;
+      disposeInFlightHistoryHandles();
+      clearMessages();
+      clearTodos();
+      setSessionId('new');
+    },
+    [disposeInFlightHistoryHandles, clearMessages, clearTodos],
+  );
 
   const handleRestoreSession = useCallback(
     (sid: string) => {
@@ -925,9 +952,9 @@ function AppContent() {
       setHistoryLoadingMore(false);
       const sid = await ensureSessionForSend();
       if (!sid) return;
-      await sendMessage(content, sid, files);
+      await sendMessage(content, sid, files, currentUser);
     })();
-  }, [disposeInFlightHistoryHandles, ensureSessionForSend, sendMessage]);
+  }, [disposeInFlightHistoryHandles, ensureSessionForSend, sendMessage, currentUser]);
 
   const handleInterrupt = useCallback((newInput?: string, files?: ChatSendFile[]) => {
     if (!sessionId || sessionId === 'new') return;
@@ -1103,6 +1130,26 @@ function AppContent() {
             <span className="mono text-sm">
               {isConnected ? t('connection.connected') : t('connection.disconnected')}
             </span>
+          </div>
+
+          {/* 用户切换（多租户隔离，无密码） */}
+          <div className="pill flex items-center gap-2">
+            <span className="text-sm">👤 {currentUser}</span>
+            <input
+              className="mono text-sm bg-transparent border border-border rounded px-2 py-0.5 w-28"
+              value={userInput}
+              onChange={(e) => setUserInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') switchUser(userInput);
+              }}
+              placeholder={t('history.userPlaceholder')}
+            />
+            <button
+              className="text-sm px-2 py-0.5 rounded border border-border hover:bg-secondary"
+              onClick={() => switchUser(userInput)}
+            >
+              {t('history.switchUser')}
+            </button>
           </div>
 
           {/* 语言切换 */}

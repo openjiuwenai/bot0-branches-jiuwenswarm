@@ -40,6 +40,7 @@ FrameCallback = Callable[[str, str, "str | None"], Awaitable[None]]
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id     TEXT PRIMARY KEY,
+    user           TEXT,
     title          TEXT,
     message_count  INTEGER DEFAULT 0,
     last_preview   TEXT,
@@ -60,8 +61,8 @@ CREATE INDEX IF NOT EXISTS idx_msg_session_ts ON messages(session_id, timestamp)
 """
 
 _UPSERT_SESSION = """
-INSERT INTO sessions (session_id, title, message_count, last_preview, created_at, updated_at)
-VALUES (?, ?, 1, ?, ?, ?)
+INSERT INTO sessions (session_id, user, title, message_count, last_preview, created_at, updated_at)
+VALUES (?, ?, ?, 1, ?, ?, ?)
 ON CONFLICT(session_id) DO UPDATE SET
     message_count = message_count + 1,
     last_preview  = excluded.last_preview,
@@ -91,13 +92,21 @@ class ChatHistoryStore:
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA foreign_keys=ON")
             await conn.executescript(_SCHEMA)
+            # 兼容旧库：sessions 无 user 列时补上（已有则忽略）
+            try:
+                await conn.execute("ALTER TABLE sessions ADD COLUMN user TEXT")
+            except Exception:
+                pass
+            # 迁移：多租户前的旧会话（user 为 NULL）归默认 guest
+            await conn.execute("UPDATE sessions SET user = 'guest' WHERE user IS NULL")
             await conn.commit()
             self._db = conn
             logger.info("[history] store 初始化完成: db=%s", self._db_path)
         return self._db
 
-    async def record_user(self, *, request_id: str, session_id: str, query: str, ts: float) -> bool:
-        """落盘一条 user 消息。重发幂等（UNIQUE 命中则不增计数）。"""
+    async def record_user(self, *, request_id: str, session_id: str, query: str, ts: float,
+                          user: str | None = None) -> bool:
+        """落盘一条 user 消息。重发幂等（UNIQUE 命中则不增计数）。user 写 sessions.user（首条定）。"""
         conn = await self._ensure()
         cur = await conn.execute(
             "INSERT OR IGNORE INTO messages (session_id, request_id, role, content, event_type, timestamp) "
@@ -108,11 +117,12 @@ class ChatHistoryStore:
         if inserted:
             await conn.execute(
                 _UPSERT_SESSION,
-                (session_id, query[:_TITLE_LEN], query[:_PREVIEW_LEN], ts, ts),
+                (session_id, user, query[:_TITLE_LEN], query[:_PREVIEW_LEN], ts, ts),
             )
         await conn.commit()
         if inserted:
-            logger.info("[history] 落盘 user: rid=%s sid=%s len=%d", request_id, session_id, len(query))
+            logger.info("[history] 落盘 user: rid=%s sid=%s user=%s len=%d",
+                        request_id, session_id, user, len(query))
         return inserted
 
     async def record_assistant(self, *, request_id: str, session_id: str, content: str,
@@ -128,7 +138,7 @@ class ChatHistoryStore:
         if inserted:
             await conn.execute(
                 _UPSERT_SESSION,
-                (session_id, None, content[:_PREVIEW_LEN], ts, ts),
+                (session_id, None, None, content[:_PREVIEW_LEN], ts, ts),
             )
         await conn.commit()
         if inserted:
@@ -201,11 +211,14 @@ def make_history_callback(store: ChatHistoryStore) -> FrameCallback:
         if not isinstance(request_id, str):
             return
         session_id = params.get("session_id")
+        user = params.get("user")
+        if not isinstance(user, str):
+            user = None
         ts = time.time()
         if isinstance(session_id, str) and session_id:
-            await store.record_user(request_id=request_id, session_id=session_id, query=query, ts=ts)
+            await store.record_user(request_id=request_id, session_id=session_id, query=query, ts=ts, user=user)
         else:
-            pending[request_id] = {"query": query, "ts": ts, "method": method}
+            pending[request_id] = {"query": query, "ts": ts, "method": method, "user": user}
             logger.debug("[history] 暂存 pending user(无 sid): rid=%s method=%s pending=%d",
                          request_id, method, len(pending))
 
@@ -241,7 +254,7 @@ def make_history_callback(store: ChatHistoryStore) -> FrameCallback:
         ts = time.time()
         if isinstance(request_id, str) and request_id in pending:
             p = pending.pop(request_id)
-            await store.record_user(request_id=request_id, session_id=session_id, query=p["query"], ts=p["ts"])
+            await store.record_user(request_id=request_id, session_id=session_id, query=p["query"], ts=p["ts"], user=p.get("user"))
             logger.info("[history] pending 回填 user: rid=%s sid=%s", request_id, session_id)
         await store.record_assistant(
             request_id=request_id if isinstance(request_id, str) else "",
@@ -275,19 +288,27 @@ def _open_readonly(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def list_sessions_sync(db_path: str | Path, *, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
-    """同步读会话列表（http.server 线程用）。db 不存在或无表返回空。"""
+def list_sessions_sync(db_path: str | Path, *, limit: int = 20, offset: int = 0,
+                       user: str | None = None) -> list[dict[str, Any]]:
+    """同步读会话列表（http.server 线程用）。db 不存在或无表返回空。user 非空时按 user 过滤。"""
     if not Path(db_path).exists():
         return []
     limit = max(1, min(limit, _MAX_LIST_LIMIT))
     offset = max(0, offset)
     conn = _open_readonly(db_path)
     try:
-        rows = conn.execute(
-            "SELECT session_id, title, message_count, last_preview, created_at, updated_at "
-            "FROM sessions ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        ).fetchall()
+        if user:
+            rows = conn.execute(
+                "SELECT session_id, user, title, message_count, last_preview, created_at, updated_at "
+                "FROM sessions WHERE user = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (user, limit, offset),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT session_id, user, title, message_count, last_preview, created_at, updated_at "
+                "FROM sessions ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
         return [dict(r) for r in rows]
     except sqlite3.OperationalError:
         return []
@@ -295,15 +316,19 @@ def list_sessions_sync(db_path: str | Path, *, limit: int = 20, offset: int = 0)
         conn.close()
 
 
-def get_session_detail_sync(db_path: str | Path, session_id: str) -> dict[str, Any] | None:
-    """同步读会话详情。db 不存在 / 无表 / 会话不存在均返回 None。"""
+def get_session_detail_sync(db_path: str | Path, session_id: str, *,
+                            user: str | None = None) -> dict[str, Any] | None:
+    """同步读会话详情。db 不存在 / 无表 / 会话不存在均返回 None。user 非空时校验归属。"""
     if not Path(db_path).exists():
         return None
     conn = _open_readonly(db_path)
     try:
+        where = "WHERE session_id = ?" + (" AND user = ?" if user else "")
+        params: tuple = (session_id, user) if user else (session_id,)
         s = conn.execute(
-            "SELECT session_id, title, message_count, last_preview, created_at, updated_at "
-            "FROM sessions WHERE session_id = ?", (session_id,),
+            "SELECT session_id, user, title, message_count, last_preview, created_at, updated_at "
+            f"FROM sessions {where}",
+            params,
         ).fetchone()
         if s is None:
             return None
@@ -312,8 +337,9 @@ def get_session_detail_sync(db_path: str | Path, session_id: str) -> dict[str, A
             "FROM messages WHERE session_id = ? ORDER BY timestamp ASC", (session_id,),
         ).fetchall()
         return {
-            "session_id": s["session_id"], "title": s["title"], "message_count": s["message_count"],
-            "last_preview": s["last_preview"], "created_at": s["created_at"], "updated_at": s["updated_at"],
+            "session_id": s["session_id"], "user": s["user"], "title": s["title"],
+            "message_count": s["message_count"], "last_preview": s["last_preview"],
+            "created_at": s["created_at"], "updated_at": s["updated_at"],
             "messages": [dict(m) for m in msgs],
         }
     except sqlite3.OperationalError:

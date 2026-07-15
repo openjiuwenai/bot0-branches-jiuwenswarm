@@ -570,15 +570,17 @@ def _run_http_server(
                     limit, offset = 20, 0
                 limit = max(1, min(limit, 100))
                 offset = max(0, offset)
+                user = (qs.get("user", [None])[0]) or None
                 body = json.dumps(
-                    {"sessions": list_sessions_sync(self.history_db, limit=limit, offset=offset)},
+                    {"sessions": list_sessions_sync(self.history_db, limit=limit, offset=offset, user=user)},
                     ensure_ascii=False,
                 ).encode("utf-8")
                 self._respond_json(body)
                 return True
             if path.startswith("/api/sessions/"):
                 session_id = path[len("/api/sessions/"):]
-                detail = get_session_detail_sync(self.history_db, session_id)
+                user = (parse_qs(parsed.query).get("user", [None])[0]) or None
+                detail = get_session_detail_sync(self.history_db, session_id, user=user)
                 if detail is None:
                     self._respond_json(json.dumps({"error": "not_found"}).encode("utf-8"), status=404)
                 else:
