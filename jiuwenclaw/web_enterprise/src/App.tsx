@@ -6,7 +6,6 @@
 
 import { useState, useCallback, useEffect, useRef, Component, ReactNode } from 'react';
 import { ChatPanel } from './components/ChatPanel';
-import { HistoryPanel } from './components/HistoryPanel';
 import { SessionSidebar } from './components/SessionSidebar';
 import { ToolPanel } from './components/ToolPanel';
 import { StatusBar } from './components/StatusBar';
@@ -26,6 +25,7 @@ import {
 } from './features/tool-events/toolEventNormalizer';
 import { useWebSocket } from './hooks';
 import { webRequest } from './services/webClient';
+import { fetchSessions as fetchDbSessions, type HistorySession } from './services/api';
 import { setToolResultDisplayMaxChars } from './utils/formatters';
 import { AgentMode, UserAnswer, ChatSendFile, ModelEntry } from './types';
 import {
@@ -41,7 +41,7 @@ import i18n from './i18n';
 import { getProductName } from './utils/env';
 import './App.css';
 
-type MainNavKey = 'chat' | 'history';
+type MainNavKey = 'chat';
 
 // 错误边界组件
 interface ErrorBoundaryState {
@@ -230,7 +230,7 @@ function AppContent() {
     const stored = getStoredSessionId();
     return stored || 'new';
   });
-  const [activeNav, setActiveNav] = useState<MainNavKey>('chat');
+  const [activeNav] = useState<MainNavKey>('chat');
   const [serverConfig, setServerConfig] = useState<Record<string, unknown> | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
   const [initialDataLoaded, setInitialDataLoaded] = useState(false);
@@ -262,6 +262,7 @@ function AppContent() {
     totalPages: number;
   } | null>(null);
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
+  const [dbSessions, setDbSessions] = useState<HistorySession[]>([]);
   const sessionIdRef = useRef(sessionId);
   const historyRestoreHandleRef = useRef<HistoryRestoreHandle | null>(null);
   const historyPageHandleRef = useRef<HistoryRestoreHandle | null>(null);
@@ -269,6 +270,8 @@ function AppContent() {
   const historyRestoreFromPanelHintRef = useRef(false);
   /** 用户已开始实时对话后，禁止后台 history.get 覆盖当前消息 */
   const historyRestoreSuppressedRef = useRef(false);
+  /** 点击会话列表恢复时置 true，驱动 historyRestore effect 拉历史；新建/刷新页面不拉 */
+  const restoreRequestedRef = useRef(false);
   /** extSettings 路由字段变更后，待 WS 重连完成再 session.create */
   const pendingRoutingSessionResetRef = useRef(false);
 
@@ -563,6 +566,8 @@ function AppContent() {
     if (!sessionId.startsWith('sess_')) return;
 
     if (historyRestoreSuppressedRef.current) return;
+    // 仅"点击会话列表恢复"时拉历史；新建/刷新页面不主动拉（保留原禁用意图）
+    if (!restoreRequestedRef.current) return;
     if (useChatStore.getState().messages.length > 0) {
       historyRestoreSuppressedRef.current = true;
       return;
@@ -575,10 +580,6 @@ function AppContent() {
     setProcessing(false);
     setThinking(false);
     setPaused(false);
-
-    // 不再主动拉取历史会话：任何场景下都直接返回空，不发送 history.get 请求。
-    // 下方 beginHistoryRestore / request(HISTORY_GET_METHOD) 等逻辑保留但不再执行。
-    return;
 
     const historyRequestId = `history-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
     logHistoryRestore('effect.start', { sessionId, historyRequestId, isConnected });
@@ -596,6 +597,7 @@ function AppContent() {
       sessionId: sessionId,
       requestId: historyRequestId,
       onReady: (messages, totalPages) => {
+        restoreRequestedRef.current = false;
         if (historyRestoreSuppressedRef.current) {
           logHistoryRestore('onReady.suppressed', { sessionId });
           return;
@@ -625,6 +627,7 @@ function AppContent() {
         });
       },
       onEmpty: (emptyTotalPages) => {
+        restoreRequestedRef.current = false;
         if (historyRestoreSuppressedRef.current) {
           logHistoryRestore('onEmpty.suppressed', { sessionId });
           return;
@@ -758,7 +761,39 @@ function AppContent() {
   }, [isConnected, sessionId, request, disposeInFlightHistoryHandles]);
 
   // 新建会话：立即生成可用的 session_id，避免停留在 'new' 导致无法发送消息
+  const loadDbSessions = useCallback(async () => {
+    try {
+      setDbSessions(await fetchDbSessions());
+    } catch (e) {
+      console.error('loadDbSessions failed', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadDbSessions();
+  }, [loadDbSessions]);
+
+  const handleRestoreSession = useCallback(
+    (sid: string) => {
+      if (!sid) return;
+      // 标记"要拉历史"，驱动下面的 historyRestore effect 从 AgentServer 恢复该会话
+      restoreRequestedRef.current = true;
+      disposeInFlightHistoryHandles();
+      clearMessages();
+      clearTodos();
+      setHistoryPagerMeta(null);
+      setHistoryLoadingMore(false);
+      setProcessing(false);
+      setThinking(false);
+      setPaused(false);
+      setSessionId(sid);
+      storeSessionId(sid);
+    },
+    [disposeInFlightHistoryHandles, clearMessages, clearTodos],
+  );
+
   const handleNewSession = useCallback(async () => {
+    restoreRequestedRef.current = false;
     disposeInFlightHistoryHandles();
     setHistoryPagerMeta(null);
     setHistoryLoadingMore(false);
@@ -788,6 +823,7 @@ function AppContent() {
         }
       }
       await fetchSessions();
+      void loadDbSessions();
     } catch (error) {
       console.error('Failed to create session:', error);
       return;
@@ -1041,10 +1077,6 @@ function AppContent() {
     sessionId,
   ]);
 
-  const handleNavigate = useCallback((nav: MainNavKey) => {
-    setActiveNav(nav);
-  }, []);
-
   const heartbeatToastPreviewRaw = heartbeatToastMessage.replace(/\s+/g, ' ').trim();
   const heartbeatToastPreview = heartbeatToastPreviewRaw.length > 120
     ? `${heartbeatToastPreviewRaw.slice(0, 120)}...`
@@ -1083,8 +1115,10 @@ function AppContent() {
 
       {/* Navigation Sidebar */}
       <SessionSidebar
-        activeNav={activeNav}
-        onNavigate={handleNavigate}
+        sessions={dbSessions}
+        currentSessionId={sessionId}
+        onSelect={handleRestoreSession}
+        onNewSession={handleNewSession}
         appVersion={typeof serverConfig?.app_version === 'string' ? serverConfig.app_version : '0.1.7'}
       />
 
@@ -1098,11 +1132,6 @@ function AppContent() {
           </div>
         )}
 
-        {activeNav === 'history' && (
-          <div className="app-section">
-            <HistoryPanel />
-          </div>
-        )}
         {activeNav === 'chat' && (
           <>
             <div className="flex-1 flex min-h-0 overflow-hidden">

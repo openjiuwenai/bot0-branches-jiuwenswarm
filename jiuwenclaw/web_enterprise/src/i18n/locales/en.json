@@ -49,6 +49,7 @@
   },
   "history": {
     "title": "Chat History",
+    "newSession": "New chat",
     "subtitle": "Browse conversations archived on Web Pod",
     "refresh": "Refresh",
     "loading": "Loading...",
