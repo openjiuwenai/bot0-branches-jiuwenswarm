@@ -793,6 +793,11 @@ function AppContent() {
       setUserInput('');
       restoreRequestedRef.current = false;
       disposeInFlightHistoryHandles();
+      setHistoryPagerMeta(null);
+      setHistoryLoadingMore(false);
+      setProcessing(false);
+      setThinking(false);
+      setPaused(false);
       clearMessages();
       clearTodos();
       setSessionId('new');
@@ -867,6 +872,7 @@ function AppContent() {
     clearTodos,
     disposeInFlightHistoryHandles,
     fetchSessions,
+    loadDbSessions,
     mode,
     request,
     setCurrentSession,
