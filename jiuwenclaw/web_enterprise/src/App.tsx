@@ -959,8 +959,9 @@ function AppContent() {
       const sid = await ensureSessionForSend();
       if (!sid) return;
       await sendMessage(content, sid, files, currentUser);
+      void loadDbSessions();
     })();
-  }, [disposeInFlightHistoryHandles, ensureSessionForSend, sendMessage, currentUser]);
+  }, [disposeInFlightHistoryHandles, ensureSessionForSend, sendMessage, currentUser, loadDbSessions]);
 
   const handleInterrupt = useCallback((newInput?: string, files?: ChatSendFile[]) => {
     if (!sessionId || sessionId === 'new') return;
