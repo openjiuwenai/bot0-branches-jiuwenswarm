@@ -273,6 +273,7 @@ interface InputAreaProps {
   onEnsureSession: (initialTitle?: string) => Promise<string | null>;
   onNewSession: () => void;
   onForkSession: (sourceSessionId: string) => Promise<void>;
+  onStartSideConversation: (sourceSessionId: string, prompt?: string) => Promise<void>;
   /** Signals that the user is editing an existing real Session. */
   onInputIntent?: (sessionId: string) => void;
   onPersistMedia: (content: string, mediaItems: MediaItem[]) => Promise<PersistMediaResponse>;
@@ -638,6 +639,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     onEnsureSession,
     onNewSession,
     onForkSession,
+    onStartSideConversation,
     onInputIntent,
     onPersistMedia,
     onPersistDocuments,
@@ -1877,6 +1879,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               submitMessage: onSubmit,
               startNewConversation: onNewSession,
               forkConversation: onForkSession,
+              startSideConversation: onStartSideConversation,
             },
             args,
           );
@@ -1972,6 +1975,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     onSubmit,
     onNewSession,
     onForkSession,
+    onStartSideConversation,
     onInterrupt,
     mode,
     isAgentMode,
@@ -2151,6 +2155,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 submitMessage: onSubmit,
                 startNewConversation: onNewSession,
                 forkConversation: onForkSession,
+                startSideConversation: onStartSideConversation,
               },
               '',
             );
@@ -2293,6 +2298,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       mode,
       onNewSession,
       onForkSession,
+      onStartSideConversation,
       onSubmit,
       setRangeStartByTextOffset,
     ],

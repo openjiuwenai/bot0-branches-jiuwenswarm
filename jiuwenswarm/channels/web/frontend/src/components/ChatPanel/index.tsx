@@ -102,6 +102,7 @@ interface ChatPanelProps {
     sourceSessionId: string,
     forkPoint?: MessageForkPoint,
   ) => Promise<void>;
+  onStartSideConversation: (sourceSessionId: string, prompt?: string) => Promise<void>;
   continuedFromSessionId?: string | null;
   onOpenContinuedFromSession?: (sourceSessionId: string) => void;
   onInputIntent?: (sessionId: string) => void;
@@ -946,6 +947,7 @@ export const ChatPanel = React.memo(function ChatPanel({
   onEnsureSession,
   onNewSession,
   onForkSession,
+  onStartSideConversation,
   continuedFromSessionId = null,
   onOpenContinuedFromSession,
   onInputIntent,
@@ -1878,6 +1880,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                   onEnsureSession={onEnsureSession}
                   onNewSession={onNewSession}
                   onForkSession={onForkSession}
+                  onStartSideConversation={onStartSideConversation}
                   onInputIntent={onInputIntent}
                   onPersistMedia={onPersistMedia}
                   onPersistDocuments={onPersistDocuments}
@@ -1950,6 +1953,7 @@ export const ChatPanel = React.memo(function ChatPanel({
             onEnsureSession={onEnsureSession}
             onNewSession={onNewSession}
             onForkSession={onForkSession}
+            onStartSideConversation={onStartSideConversation}
             onInputIntent={onInputIntent}
             onPersistMedia={onPersistMedia}
             onPersistDocuments={onPersistDocuments}
