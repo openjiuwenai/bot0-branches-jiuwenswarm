@@ -272,6 +272,7 @@ interface InputAreaProps {
   onSubmit: (content: string, mediaItems?: MediaItem[]) => void;
   onEnsureSession: (initialTitle?: string) => Promise<string | null>;
   onNewSession: () => void;
+  onForkSession: (sourceSessionId: string) => Promise<void>;
   /** Signals that the user is editing an existing real Session. */
   onInputIntent?: (sessionId: string) => void;
   onPersistMedia: (content: string, mediaItems: MediaItem[]) => Promise<PersistMediaResponse>;
@@ -636,6 +637,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     onSubmit,
     onEnsureSession,
     onNewSession,
+    onForkSession,
     onInputIntent,
     onPersistMedia,
     onPersistDocuments,
@@ -1874,6 +1876,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               addMessage: useChatStore.getState().addMessage,
               submitMessage: onSubmit,
               startNewConversation: onNewSession,
+              forkConversation: onForkSession,
             },
             args,
           );
@@ -1968,6 +1971,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     isInterruptible,
     onSubmit,
     onNewSession,
+    onForkSession,
     onInterrupt,
     mode,
     isAgentMode,
@@ -2112,8 +2116,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           setComposerSuggestion(null);
           return;
         }
-        // 无参命令（/new、/plan、/compact）：选中即执行，不插入文本、不再等回车。
-        // `/new hi`、`/plan hi` 这类手工输入不走此选中路径，提交时会被当作普通消息。
+        // 无参命令（/new、/fork、/plan、/compact）：选中即执行，不插入文本、不再等回车。
+        // `/fork title`、`/plan hi` 这类手工输入不走此选中路径，提交时会被当作普通消息。
         if (slashCmd && slashTakesArgs === false) {
           const trigger = getCurrentComposerTrigger();
           if (trigger) {
@@ -2146,6 +2150,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 addMessage: useChatStore.getState().addMessage,
                 submitMessage: onSubmit,
                 startNewConversation: onNewSession,
+                forkConversation: onForkSession,
               },
               '',
             );
@@ -2287,6 +2292,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       getCurrentComposerTrigger,
       mode,
       onNewSession,
+      onForkSession,
       onSubmit,
       setRangeStartByTextOffset,
     ],

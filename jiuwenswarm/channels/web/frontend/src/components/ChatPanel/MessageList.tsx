@@ -54,6 +54,7 @@ interface MessageListProps {
   onLoadOlderHistory?: () => void | Promise<void>;
   teamLeaderIdentityOverride?: TeamLeaderIdentity | null;
   teamGroupIdentityOverride?: AgentGroupIdentity | null;
+  onForkFromMessage?: (message: Message) => Promise<void>;
 }
 
 interface ChatTimelineListProps {
@@ -73,6 +74,7 @@ interface ChatTimelineListProps {
   renderAfterMessage?: (message: Message) => ReactNode;
   teamLeaderIdentityOverride?: TeamLeaderIdentity | null;
   teamGroupIdentityOverride?: AgentGroupIdentity | null;
+  onForkFromMessage?: (message: Message) => Promise<void>;
   /** 交互时间线按会话保存派生快照和逐批准入窗口。 */
   sessionId?: string | null;
   /** 内容不足一屏时继续发布已存在的更早历史。 */
@@ -627,6 +629,7 @@ export function ChatTimelineList({
   onLoadOlderHistory,
   teamLeaderIdentityOverride,
   teamGroupIdentityOverride,
+  onForkFromMessage,
 }: ChatTimelineListProps) {
   const isTeamMode = mode === 'team';
   const activeSessionId = useChatStore((s) => s.activeSessionId);
@@ -1177,6 +1180,7 @@ export function ChatTimelineList({
                       enableAssistantAvatar={!isTeamMode}
                       teamLeaderIdentityOverride={teamLeaderIdentity}
                       teamGroupIdentityOverride={teamGroupIdentity}
+                      onForkFromMessage={onForkFromMessage}
                     />
                     {renderAfterMessage?.(item.message)}
                   </>
@@ -1195,6 +1199,7 @@ export function ChatTimelineList({
                       enableAssistantAvatar={!isTeamMode}
                       teamLeaderIdentityOverride={teamLeaderIdentity}
                       teamGroupIdentityOverride={teamGroupIdentity}
+                      onForkFromMessage={onForkFromMessage}
                     />
                     {turnOpen ? renderAfterMessage?.(item.message) : null}
                   </div>
@@ -1213,6 +1218,7 @@ export function ChatTimelineList({
                 enableAssistantAvatar={!isTeamMode}
                 teamLeaderIdentityOverride={teamLeaderIdentity}
                 teamGroupIdentityOverride={teamGroupIdentity}
+                onForkFromMessage={onForkFromMessage}
               />
               {renderAfterMessage?.(item.message)}
             </Fragment>
@@ -1401,6 +1407,7 @@ export function MessageList({
   onLoadOlderHistory,
   teamLeaderIdentityOverride,
   teamGroupIdentityOverride,
+  onForkFromMessage,
 }: MessageListProps) {
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const toolExecutions = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.toolExecutions ?? new Map());
@@ -1422,6 +1429,7 @@ export function MessageList({
       onLoadOlderHistory={onLoadOlderHistory}
       teamLeaderIdentityOverride={teamLeaderIdentityOverride}
       teamGroupIdentityOverride={teamGroupIdentityOverride}
+      onForkFromMessage={onForkFromMessage}
     />
   );
 }

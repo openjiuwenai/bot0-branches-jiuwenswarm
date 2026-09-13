@@ -705,6 +705,7 @@ class _DummyBus:
 _FORWARD_REQ_METHODS = frozenset({
     "initialize",
     "session.switch",
+    "session.fork",
     "acp.tool_response",
     "team.delete",
     "command.goal",
@@ -876,6 +877,7 @@ _FORWARD_REQ_METHODS = frozenset({
 _FORWARD_NO_LOCAL_HANDLER_METHODS = frozenset({
     "initialize",
     "session.switch",
+    "session.fork",
     "acp.tool_response",
     "team.templates.list",
     "team.bindings.list",
