@@ -3767,6 +3767,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                         onSetGoal={setGoalObjective}
                         onPauseGoal={pauseGoal}
                         onResumeGoal={resumeGoal}
+                        onRefreshGoal={refreshGoal}
                         onClearGoal={handleClearGoal}
                         onDrainTaskQueueIfIdle={drainTaskQueueIfIdle}
                       />
