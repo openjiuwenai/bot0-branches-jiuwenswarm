@@ -9134,6 +9134,26 @@ class JiuWenSwarmDeepAdapter:
             )
             return self._instance
 
+    async def _ensure_instance_initialized_off_loop(self) -> None:
+        """Run ``DeepAgent.ensure_initialized`` off the main event loop.
+
+        Same pattern as ``JiuwenSwarmCodeAdapter.create_instance``: the method
+        is ``async def`` but the body is sync (``init_workspace`` / ``rail.init``).
+        Awaiting it on this loop blocks health, SSE, and WebSocket recv.
+
+        ``asyncio.to_thread`` cannot wrap an async function. The worker starts a
+        throwaway loop with ``asyncio.run`` and must not touch main-loop Lock /
+        Queue / Task objects — only this instance's rails and workspace files.
+        """
+        instance = self._instance
+        if instance is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: asyncio.run(instance.ensure_initialized()),
+        )
+
     async def create_instance(
         self,
         config: dict[str, Any] | None = None,
@@ -9323,7 +9343,7 @@ class JiuWenSwarmDeepAdapter:
                 _apply_llm_io_trace_patch()
 
                 await asyncio.sleep(0)
-                await self._instance.ensure_initialized()
+                await self._ensure_instance_initialized_off_loop()
                 initial_runtime_workspace = self._project_dir or str(
                     get_default_project_session_workspace_dir()
                 )
