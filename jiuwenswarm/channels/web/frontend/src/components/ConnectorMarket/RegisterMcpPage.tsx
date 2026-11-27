@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Minus, Plus } from 'lucide-react';
-import { useConnectorStore } from '../../stores/connectorStore';
+import { detailCacheKey, useConnectorStore } from '../../stores/connectorStore';
 import { Input } from '../ui/Input/Input';
 import { FormPageLayout } from './FormPageLayout';
 
@@ -107,6 +107,10 @@ interface RegisterMcpPageProps {
   editName?: string;
 }
 
+// 连接器名称同时作为自定义 MCP 的 server 标识（state.json 的 name / server_id_scope），
+// 与技能名、定时任务名保持同一档 64 字符上限；超长名称会在卡片标题和 tooltip 里溢出。
+const NAME_MAX_LENGTH = 64;
+
 const JSON_EXAMPLE = `// 示例:
 // {
 //   "mcpServers": {
@@ -137,7 +141,9 @@ const JSON_EXAMPLE = `// 示例:
 export function RegisterMcpPage({ onBack, onRegistered, editName }: RegisterMcpPageProps) {
   const { t } = useTranslation();
   const registerCustom = useConnectorStore((s) => s.registerCustom);
-  const detail = useConnectorStore((s) => (editName ? s.detailCache[editName] : undefined));
+  const detail = useConnectorStore((s) =>
+    editName ? s.detailCache[detailCacheKey(editName)] : undefined,
+  );
   const loadDetail = useConnectorStore((s) => s.loadDetail);
   const [type, setType] = useState<McpConfigType>('stdio');
   const [name, setName] = useState('');
@@ -165,7 +171,9 @@ export function RegisterMcpPage({ onBack, onRegistered, editName }: RegisterMcpP
   // 数据时回填（backfilled 门控），避免后台轮询刷新 detailCache 时把用户正在编辑的内容覆盖掉。
   useEffect(() => {
     if (!editName) return;
-    void loadDetail(editName, { refresh: true });
+    // Explicit sourceId: undefined keeps customize detail on the bare-name cache
+    // slot (do not inherit enterprise catalogSourceId from a prior catalogue tab).
+    void loadDetail(editName, { refresh: true, sourceId: undefined });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editName]);
 
@@ -191,7 +199,8 @@ export function RegisterMcpPage({ onBack, onRegistered, editName }: RegisterMcpP
     setJsonPaste(value);
     const parsed = parseJsonPasteConfig(value);
     if (!parsed) return;
-    if (parsed.name) setName(parsed.name);
+    // JSON 里解析出的名称同样受输入框上限约束，避免绕过 maxLength 塞进超长名称。
+    if (parsed.name) setName(parsed.name.slice(0, NAME_MAX_LENGTH));
     setType(parsed.transport);
     if (parsed.command !== undefined) setCommand(parsed.command);
     if (parsed.args !== undefined) setArgs(rowsFromArray(parsed.args));
@@ -280,6 +289,9 @@ export function RegisterMcpPage({ onBack, onRegistered, editName }: RegisterMcpP
           readOnly={!!editName}
           disabled={!!editName}
           invalid={fieldErrors.name}
+          maxLength={NAME_MAX_LENGTH}
+          showCounter={!editName}
+          counterTestId="connector-market-register-mcp-name-counter"
           data-testid="connector-market-register-mcp-name"
         />
       </Field>

@@ -25,8 +25,10 @@ import subprocess
 import sys
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+
+from jiuwenswarm.common.process_identity import ProcessIdentity, process_identity_matches, read_process_identity
 
 logger = logging.getLogger("jiuwenswarm.app")
 
@@ -157,13 +159,13 @@ def _within_budget(history: deque[float], limit: int, now: float) -> bool:
     return True
 
 
-def _process_create_time(pid: int | None) -> float | None:
+def _process_create_time(pid: int | None) -> ProcessIdentity | None:
     if pid is None:
         return None
     import psutil
 
     try:
-        return psutil.Process(pid).create_time()
+        return read_process_identity(pid, process=psutil.Process(pid))
     except psutil.Error:
         return None
 
@@ -174,7 +176,7 @@ class _Child:
         self.command = list(command)
         self.proc: subprocess.Popen | None = None
         self.started_at = 0.0
-        self.create_time: float | None = None
+        self.create_time: ProcessIdentity | None = None
         self.own_session = False
         self.crash_restarts: deque[float] = deque()
         self.restart_requests: deque[float] = deque()
@@ -237,7 +239,7 @@ def application_shutdown():
             signal.signal(signum, handler)
 
 
-def signal_service_tree(pid: int, *, force: bool = False, expected_created: float | None = None) -> list[Any]:
+def signal_service_tree(pid: int, *, force: bool = False, expected_created: ProcessIdentity | None = None) -> list[Any]:
     """Signal an owned launcher and proven services, retaining Worker branches."""
     import psutil
 
@@ -250,8 +252,11 @@ def signal_service_tree(pid: int, *, force: bool = False, expected_created: floa
         return []
     except psutil.Error as exc:
         raise RuntimeError("Service launcher identity could not be inspected") from exc
-    if expected_created is not None and parent.create_time() != expected_created:
-        raise RuntimeError("Service launcher PID identity changed")
+    try:
+        if expected_created is not None and not process_identity_matches(pid, expected_created, process=parent):
+            raise RuntimeError("Service launcher PID identity changed")
+    except psutil.Error as exc:
+        raise RuntimeError(f"Service launcher pid={pid} identity could not be inspected: {exc}") from exc
     try:
         children = parent.children(recursive=True)
     except psutil.NoSuchProcess:
@@ -304,7 +309,7 @@ def signal_service_tree(pid: int, *, force: bool = False, expected_created: floa
     return targets
 
 
-def terminate_service_tree(pid: int, *, timeout: float = 10.0, expected_created: float | None = None) -> None:
+def terminate_service_tree(pid: int, *, timeout: float = 10.0, expected_created: ProcessIdentity | None = None) -> None:
     """Observe service exit before the application retires its detached Worker."""
     import psutil
 
@@ -359,7 +364,7 @@ def _reap_lingering_tree(child: _Child) -> None:
 
         try:
             dead = psutil.Process(proc.pid)
-            if dead.create_time() != child.create_time:
+            if not process_identity_matches(proc.pid, child.create_time, process=dead):
                 return  # PID already recycled; those descendants are a stranger's
             descendants = dead.children(recursive=True)
         except psutil.Error:
@@ -372,11 +377,24 @@ def _reap_lingering_tree(child: _Child) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
 
 
-def supervise(commands: Mapping[str, Sequence[str]], popen_kwargs: Mapping[str, Any]) -> int:
+def supervise(
+    commands: Mapping[str, Sequence[str]],
+    popen_kwargs: Mapping[str, Any],
+    *,
+    restart_requested: Callable[[], bool] | None = None,
+    restart_names: Sequence[str] = (),
+    before_restart: Callable[[], None] | None = None,
+    command_popen_kwargs: Mapping[str, Mapping[str, Any]] | None = None,
+) -> int:
     """Run *commands* (spawned in order) until one stops for good; return its exit code.
 
     Returns 130 on KeyboardInterrupt. All children are terminated on return.
     """
+    overrides = command_popen_kwargs or {}
+
+    def popen_kwargs_for(name: str) -> Mapping[str, Any]:
+        return overrides.get(name, popen_kwargs)
+
     children = [_Child(name, command) for name, command in commands.items()]
     try:
         # Spawning happens inside the try so that a signal (or a failing later
@@ -384,8 +402,13 @@ def supervise(commands: Mapping[str, Sequence[str]], popen_kwargs: Mapping[str, 
         # KeyboardInterrupt is a BaseException, so an `except Exception` guard
         # around a spawn would have let it orphan the children already started.
         for child in children:
-            child.spawn(popen_kwargs)
+            child.spawn(popen_kwargs_for(child.name))
         while True:
+            if restart_requested is not None and restart_requested():
+                if _restart_selected_children(
+                    children, popen_kwargs_for, restart_names, before_restart
+                ):
+                    continue
             for child in children:
                 proc = child.proc
                 if proc is None:
@@ -413,7 +436,7 @@ def supervise(commands: Mapping[str, Sequence[str]], popen_kwargs: Mapping[str, 
                     return returncode or 0
                 _reap_lingering_tree(child)
                 time.sleep(_RESTART_BACKOFF)
-                child.spawn(popen_kwargs)
+                child.spawn(popen_kwargs_for(child.name))
                 new_proc = child.proc
                 logger.warning(
                     "[app] %s respawned (pid %s)",
@@ -425,3 +448,32 @@ def supervise(commands: Mapping[str, Sequence[str]], popen_kwargs: Mapping[str, 
         return 130
     finally:
         _terminate_all([child.proc for child in children if child.proc is not None])
+
+
+def _restart_selected_children(
+    children: Sequence[_Child],
+    popen_kwargs_for: Callable[[str], Mapping[str, Any]],
+    names: Sequence[str],
+    before_restart: Callable[[], None] | None,
+) -> bool:
+    """Restart explicitly selected services after the owner has retired its Worker."""
+    selected = [child for child in children if child.name in names]
+    if not selected:
+        return False
+    by_name = {child.name: child for child in selected}
+    stop_order = [by_name[name] for name in names if name in by_name]
+    with application_shutdown():
+        _terminate_all([child.proc for child in stop_order if child.proc is not None])
+        if before_restart is not None:
+            before_restart()
+        try:
+            for child in selected:
+                child.spawn(popen_kwargs_for(child.name))
+                logger.info("[app] %s restarted (pid %s)", child.name, child.proc.pid)
+        except BaseException:
+            # A partial replacement may already have started a fresh resident Worker.
+            _terminate_all([child.proc for child in stop_order if child.proc is not None])
+            if before_restart is not None:
+                before_restart()
+            raise
+    return True

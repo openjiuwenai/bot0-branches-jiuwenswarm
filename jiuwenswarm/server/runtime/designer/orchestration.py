@@ -909,6 +909,62 @@ _JSON_RETRY_RULE = (
     "no reasoning, no markdown fences, and every newline or quote inside a string escaped."
 )
 
+_SCENE_DECLARATION_RETRY_RULE = (
+    "\nThe previous reply placed shots in settings that scenes[] never declared with a "
+    "real place name. Declare every distinct setting in scenes[] (id, a 2-6 word place "
+    "name, description) and make every shot.setting_id match one of those ids."
+)
+
+
+def _execution_graph_named_scenes(
+    parsed: dict[str, Any], analysis: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Scenes known after the execution-graph reply, keyed by id.
+
+    The Director may rename or add places; its entries win over the earlier
+    analysis. A name equal to the id carries no place information — prefer the
+    description, then the name the earlier analysis already had (mirrors
+    ``_normalize_llm_analysis``).
+    """
+    from jiuwenswarm.server.runtime.designer.script_analysis import _scene_name_is_placeholder
+
+    merged: dict[str, dict[str, Any]] = {}
+    for source in (analysis.get("scenes"), parsed.get("scenes")):
+        if not isinstance(source, list):
+            continue
+        for i, sc in enumerate(source, start=1):
+            if not isinstance(sc, dict):
+                continue
+            sid = str(sc.get("id") or f"set_{i}").strip()
+            name = str(sc.get("name") or "").strip()
+            desc = str(sc.get("description") or "").strip()
+            if not name or _scene_name_is_placeholder(name, sid):
+                name = desc
+            existing = merged.get(sid)
+            if not name and existing and str(existing.get("name") or "").strip():
+                name = str(existing["name"])
+            entry = dict(sc)
+            entry["id"] = sid
+            entry["name"] = name
+            if desc:
+                entry["description"] = desc
+            merged[sid] = entry
+    return list(merged.values())
+
+
+def _shots_without_named_scene(parsed: dict[str, Any], scenes: list[dict[str, Any]]) -> list[str]:
+    """Sorted setting_ids the shots cite without a named scene; empty when all valid."""
+    named = {str(sc.get("id") or "") for sc in scenes if str(sc.get("name") or "").strip()}
+    missing: list[str] = []
+    shots = [s for s in (parsed.get("clips") or []) if isinstance(s, dict)]
+    for i, sh in enumerate(shots, start=1):
+        sid = str(sh.get("setting_id") or "").strip()
+        if not sid:
+            sid = next(iter(named)) if len(named) == 1 else f"set_{i}"
+        if sid not in named and sid not in missing:
+            missing.append(sid)
+    return sorted(missing)
+
 
 async def _model_json_object(
     *, phase: str, prompt: str, system: str, max_tokens: int
@@ -1068,110 +1124,112 @@ class Director:
         Chat credentials are gated at Enter/chat/Play entry — never demote to
         handler when the model is missing.
         """
-        from jiuwenswarm.server.runtime.designer.smart_graph import (
-            find_non_contributing_node_ids,
-        )
+        from jiuwenswarm.common.design_generation_selection import reuse_catalogue_snapshot
+        with reuse_catalogue_snapshot():
+            from jiuwenswarm.server.runtime.designer.smart_graph import (
+                find_non_contributing_node_ids,
+            )
 
-        notes: list[str] = []
-        onboarded: list[str] = []
-        notes.extend(note_user_canvas_edits(graph))
+            notes: list[str] = []
+            onboarded: list[str] = []
+            notes.extend(note_user_canvas_edits(graph))
 
-        from jiuwenswarm.server.runtime.designer.user_references import (
-            is_uploaded_media_node,
-        )
+            from jiuwenswarm.server.runtime.designer.user_references import (
+                is_uploaded_media_node,
+            )
 
-        for node in graph.get("nodes") or []:
-            if not isinstance(node, dict):
-                continue
-            cfg = dict(node.get("config") or {})
-            nid = str(node.get("id") or "")
-            # Uploaded references are routed by image classification, not by
-            # the "user drew this node, do not invent edges" rule.
-            if not nid or is_uploaded_media_node(node) or not cfg.get("user_added"):
-                continue
-            onboarded.append(nid)
-            if is_comfyui_node(node):
-                # Imported ComfyUI params go to vLLM-Omni verbatim; no agent rewrites them.
-                cfg["force_handler"] = True
-                cfg["skip_llm"] = True
-                cfg["delegate"] = "handler"
+            for node in graph.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                cfg = dict(node.get("config") or {})
+                nid = str(node.get("id") or "")
+                # Uploaded references are routed by image classification, not by
+                # the "user drew this node, do not invent edges" rule.
+                if not nid or is_uploaded_media_node(node) or not cfg.get("user_added"):
+                    continue
+                onboarded.append(nid)
+                if is_comfyui_node(node):
+                    # Imported ComfyUI params go to vLLM-Omni verbatim; no agent rewrites them.
+                    cfg["force_handler"] = True
+                    cfg["skip_llm"] = True
+                    cfg["delegate"] = "handler"
+                    node["config"] = cfg
+                    notes.append(f"comfyui:{nid}")
+                    continue
+                role = _role_key(node)
+                tools = _tools_for_node(node)
+                cfg["kind"] = "agent"
+                cfg["tools"] = tools
+                cfg["user_added"] = True
+                cfg.pop("force_handler", None)
+                cfg.pop("skip_llm", None)
+                cfg["delegate"] = "agent"
+                if not str(cfg.get("director_task") or "").strip():
+                    cfg["director_task"] = (
+                        f"User-added {role or node.get('type') or 'node'} agent. "
+                        f"Use tools {', '.join(tools)}. "
+                        "Respect film-wide style_lock, spatial_lock, and "
+                        "costume/identity locks. Use only the edges the user connected. "
+                        "Do not invent upstream or downstream links."
+                    )[:800]
+                notes.append(f"agent:{nid}")
+                notes.append(f"unwired_until_user:{nid}")
+
                 node["config"] = cfg
-                notes.append(f"comfyui:{nid}")
-                continue
-            role = _role_key(node)
-            tools = _tools_for_node(node)
-            cfg["kind"] = "agent"
-            cfg["tools"] = tools
-            cfg["user_added"] = True
-            cfg.pop("force_handler", None)
-            cfg.pop("skip_llm", None)
-            cfg["delegate"] = "agent"
-            if not str(cfg.get("director_task") or "").strip():
-                cfg["director_task"] = (
-                    f"User-added {role or node.get('type') or 'node'} agent. "
-                    f"Use tools {', '.join(tools)}. "
-                    "Respect film-wide style_lock, spatial_lock, and "
-                    "costume/identity locks. Use only the edges the user connected. "
-                    "Do not invent upstream or downstream links."
-                )[:800]
-            notes.append(f"agent:{nid}")
-            notes.append(f"unwired_until_user:{nid}")
 
-            node["config"] = cfg
+            # Director lock-gates every user-added media leaf.
+            lock_notes: list[str] = []
+            for node in graph.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
+                if (
+                    not cfg.get("user_added")
+                    or is_uploaded_media_node(node)
+                    or is_comfyui_node(node)
+                ):
+                    continue
+                if _role_key(node) not in {
+                    "clip",
+                    "character",
+                    "scene",
+                    "image",
+                    "video",
+                }:
+                    continue
+                gate = self.review_leaf_media_prompt(graph, node)
+                if gate.get("patched"):
+                    lock_notes.append(f"locks:{node.get('id')}")
+                notes.extend(
+                    [f"mgr:{x}" for x in (gate.get("notes") or []) if isinstance(x, str)][:4]
+                )
 
-        # Director lock-gates every user-added media leaf.
-        lock_notes: list[str] = []
-        for node in graph.get("nodes") or []:
-            if not isinstance(node, dict):
-                continue
-            cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
-            if (
-                not cfg.get("user_added")
-                or is_uploaded_media_node(node)
-                or is_comfyui_node(node)
-            ):
-                continue
-            if _role_key(node) not in {
-                "clip",
-                "character",
-                "scene",
-                "image",
-                "video",
-            }:
-                continue
-            gate = self.review_leaf_media_prompt(graph, node)
-            if gate.get("patched"):
-                lock_notes.append(f"locks:{node.get('id')}")
-            notes.extend(
-                [f"mgr:{x}" for x in (gate.get("notes") or []) if isinstance(x, str)][:4]
-            )
-
-        user_added_ids: set[str] = set()
-        for n in graph.get("nodes") or []:
-            if isinstance(n, dict) and isinstance(n.get("config"), dict) and n["config"].get("user_added"):
-                user_added_ids.add(str(n.get("id") or ""))
-        orphans = [nid for nid in find_non_contributing_node_ids(graph) if nid in user_added_ids]
-        meta = dict(graph.get("metadata") or {})
-        if orphans:
-            meta["non_contributing_user_nodes"] = orphans
-            meta["contribution_warning"] = (
-                "User-added nodes do not feed the final shot/compose: "
-                + ", ".join(orphans)
-                + ". Connect them into the pipeline if you want them in the film."
-            )
-        elif onboarded:
-            meta.pop("non_contributing_user_nodes", None)
-            meta.pop("contribution_warning", None)
-        result = {
-            "ok": True,
-            "onboarded": onboarded,
-            "orphans": orphans,
-            "notes": notes[:80],
-            "lock_notes": lock_notes[:40],
-        }
-        meta["director_user_node_onboard"] = result
-        graph["metadata"] = meta
-        return result
+            user_added_ids: set[str] = set()
+            for n in graph.get("nodes") or []:
+                if isinstance(n, dict) and isinstance(n.get("config"), dict) and n["config"].get("user_added"):
+                    user_added_ids.add(str(n.get("id") or ""))
+            orphans = [nid for nid in find_non_contributing_node_ids(graph) if nid in user_added_ids]
+            meta = dict(graph.get("metadata") or {})
+            if orphans:
+                meta["non_contributing_user_nodes"] = orphans
+                meta["contribution_warning"] = (
+                    "User-added nodes do not feed the final shot/compose: "
+                    + ", ".join(orphans)
+                    + ". Connect them into the pipeline if you want them in the film."
+                )
+            elif onboarded:
+                meta.pop("non_contributing_user_nodes", None)
+                meta.pop("contribution_warning", None)
+            result = {
+                "ok": True,
+                "onboarded": onboarded,
+                "orphans": orphans,
+                "notes": notes[:80],
+                "lock_notes": lock_notes[:40],
+            }
+            meta["director_user_node_onboard"] = result
+            graph["metadata"] = meta
+            return result
 
     async def plan(
         self,
@@ -1856,7 +1914,10 @@ class Director:
                 "List that id in on_screen wherever they are visible. "
                 "NOT every character in every scene. "
                 + CLOTHING_PARTS_RULE
-                + "MUST include shots[] grouped by setting_id (distinct places). "
+                + "MUST include scenes[] — one entry per distinct setting_id: id, a "
+                "2-6 word place name, and a description. Every shot's setting_id "
+                "must appear in scenes[]. "
+                "MUST include shots[] grouped by setting_id (distinct places). "
                 "Shots are consecutive TIME windows that concatenate to the film. "
                 "Each shot.action is THAT window only — do not paste the user prompt "
                 "into every clip. Preserve every distinct narrative/content shot from the "
@@ -1890,6 +1951,7 @@ class Director:
                 '"characters":[{"id":"char_1","name":"...","description":"...",'
                 '"clothing_parts":{"top":"...","bottom":"...","outerwear":"","footwear":"...",'
                 '"accessories":"","outfit":""}}],'
+                '"scenes":[{"id":"set_1","name":"2-6 word place label","description":"..."}],'
                 '"clips":[{"clip_index":1,"timeline":"<copy this shot timeline from the approved brief>",'
                 '"action":"...",'
                 '"speech_by_character":{"char_1":"exact line"},"speech_line":"..."}],'
@@ -1901,37 +1963,60 @@ class Director:
             )
 
             shot_ceiling = infer_shot_budget(user_prompt, analysis)
-            parsed = await _model_json_object(
-                phase="execution graph",
-                prompt=json.dumps(
-                    {
-                        "user_prompt": user_prompt,
-                        "approved_brief": approved_brief,
-                        "approved_storyboard": approved_sb,
-                        "style_lock": analysis.get("style_lock"),
-                        "characters": characters,
-                        "current_shots": shots,
-                        "target_clip_count": shot_ceiling or analysis.get("target_clip_count"),
-                        "rule": (
-                            "Keep every distinct shot from the approved storyboard. "
-                            "Do not drop shots to fit a fixed count. Explicit N-shot / "
-                            "N分镜 from the user is the only ceiling. All character spec "
-                            "cards before clips; compose first clip per setting_id; "
-                            "edit_prior only within the same setting_id. Per-shot "
-                            "on_screen is authoritative for who appears — not every "
-                            "character spec in every clip."
-                        ),
-                    },
-                    ensure_ascii=False,
-                ),
-                system=system,
-                max_tokens=65536,
+            graph_prompt = json.dumps(
+                {
+                    "user_prompt": user_prompt,
+                    "approved_brief": approved_brief,
+                    "approved_storyboard": approved_sb,
+                    "style_lock": analysis.get("style_lock"),
+                    "characters": characters,
+                    "current_shots": shots,
+                    "target_clip_count": shot_ceiling or analysis.get("target_clip_count"),
+                    "rule": (
+                        "Keep every distinct shot from the approved storyboard. "
+                        "Do not drop shots to fit a fixed count. Explicit N-shot / "
+                        "N分镜 from the user is the only ceiling. All character spec "
+                        "cards before clips; compose first clip per setting_id; "
+                        "edit_prior only within the same setting_id. Per-shot "
+                        "on_screen is authoritative for who appears — not every "
+                        "character spec in every clip."
+                    ),
+                },
+                ensure_ascii=False,
             )
-            if parsed is None:
+            # Fail closed on undeclared settings: a shot in a scene-less setting
+            # has no named place to build the scene plate from, so re-ask once
+            # before failing the chain (mirrors script analysis strictness).
+            parsed: dict[str, Any] | None = None
+            for scene_attempt in (1, 2):
+                parsed = await _model_json_object(
+                    phase="execution graph",
+                    prompt=graph_prompt,
+                    system=system if scene_attempt == 1 else system + _SCENE_DECLARATION_RETRY_RULE,
+                    max_tokens=65536,
+                )
+                if parsed is None:
+                    raise DesignerLlmError(
+                        "Chat model did not return valid execution graph JSON.",
+                        code=LLM_API_ERROR,
+                    )
+                named_scenes = _execution_graph_named_scenes(parsed, analysis)
+                undeclared = _shots_without_named_scene(parsed, named_scenes)
+                if not undeclared:
+                    break
+                logger.info(
+                    "Director execution graph placed shots in undeclared settings %s (attempt %d)",
+                    ", ".join(undeclared),
+                    scene_attempt,
+                )
+            else:
                 raise DesignerLlmError(
-                    "Chat model did not return valid execution graph JSON.",
+                    "Chat model placed shots in settings it never declared as named "
+                    "scenes; please try again.",
                     code=LLM_API_ERROR,
                 )
+            if named_scenes:
+                analysis["scenes"] = named_scenes
             llm_chars = parsed.get("characters") if isinstance(parsed.get("characters"), list) else []
             cleaned_chars: list[dict[str, Any]] = []
             for i, raw in enumerate(llm_chars, start=1):
@@ -2574,8 +2659,7 @@ class Director:
                     changed = True
             except Exception:  # noqa: BLE001
                 pass
-            # Character consistency / costume still injected below for the leaf;
-            # the video API body is rewritten by director_prepare_video_prompt.
+            # Character consistency / costume remain available to the leaf agent.
             prior_shots = collect_prior_clip_prompts(graph, clip_index=clip_index)
             if not prior_shots and str(cfg.get("previous_clip_action") or "").strip():
                 prior_shots = [
@@ -2590,25 +2674,17 @@ class Director:
                 ]
             try:
                 from jiuwenswarm.server.runtime.designer.pipeline.shot_consistency_contract import (
-                    apply_consistency_contract,
-                    prompt_violates_consistency,
+                    merge_storyboard_consistency,
                 )
 
-                cfg, prompt, cont_notes = apply_consistency_contract(
+                cfg, cont_notes = merge_storyboard_consistency(
                     cfg,
                     graph=graph if isinstance(graph, dict) else {},
-                    prompt=prompt,
                 )
                 for n in cont_notes:
                     if n and n not in notes:
                         notes.append(n)
                         changed = True
-                # Hard reject: blank contaminated draft so director rewrite uses
-                # this storyboard row + structured holds (not prior Wan prose).
-                if prompt_violates_consistency(prompt, cfg=cfg):
-                    prompt = ""
-                    notes.append("reject_continuity_violation_blank_prompt")
-                    changed = True
             except Exception:  # noqa: BLE001
                 pass
             # Keep prior_shots available for debug / regenerate packets only.
@@ -2654,8 +2730,8 @@ class Director:
                     prompt = (
                         prompt
                         + "\nCHARACTER CONSISTENCY LOCK: animate ONLY on-screen people from "
-                        "character specs bound as character1/character2… (attach order). "
-                        "The LAST reference is the Scene specs (environment) — not a person. "
+                        "the attached character spec sheets (identity references). "
+                        "The LAST attached reference is the Scene specs (environment) — not a person. "
                         f"Keep faces, body types, ages, and costumes"
                         f"{(' for ' + cast_who) if cast_who else ''}. "
                         "Do not recast, redesign clothing, or invent unlabeled extras."
@@ -2793,11 +2869,6 @@ class Director:
                         break
 
         if role == "clip":
-            from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import (
-                ensure_story_lock_coverage,
-                director_approve_video_prompt,
-            )
-
             # Stamp film-wide / shot ToD onto cfg before story-form coverage.
             if not isinstance(cfg.get("time_of_day_lock"), dict) or not (
                 cfg.get("time_of_day_lock") or {}
@@ -2850,33 +2921,6 @@ class Director:
                         cfg["time_of_day_lock"] = tod
                 except Exception:  # noqa: BLE001
                     pass
-
-            approved, reasons = director_approve_video_prompt(
-                prompt,
-                cfg=cfg,
-                graph=graph if isinstance(graph, dict) else {},
-                clip_index=clip_index,
-                action=str(cfg.get("clip_action") or ""),
-                camera=str(cfg.get("camera") or ""),
-            )
-            if approved != str(prompt or "").strip():
-                notes.append("director_rewrote_video_prompt")
-                prompt = approved
-                changed = True
-            cfg["director_video_prompt_notes"] = reasons
-            cfg["director_video_prompt_notes"] = reasons
-            cfg["director_video_prompt_approved"] = True
-            # After story-form rewrite: fill missing language / ToD / style as prose
-            # (never LOCK essays — those get scrubbed on the next pass).
-            covered, cov_notes = ensure_story_lock_coverage(
-                prompt,
-                cfg,
-                graph=graph if isinstance(graph, dict) else {},
-            )
-            if covered != str(prompt or "").strip():
-                prompt = covered
-                notes.extend(cov_notes or ["ensure_story_lock_coverage"])
-                changed = True
 
         # Always stamp Director lock gate; patched=True when prompt text changed.
         # Images + clips: positive practice prompts only (no LOCK essays on tool body).
@@ -3023,90 +3067,92 @@ class Director:
         }
 
     def validate_plan_structure(self, graph: DesignerExecutionGraph) -> dict[str, Any]:
-        meta = dict(graph.get("metadata") or {})
-        modality = meta.get("modality_plan")
-        if not isinstance(modality, dict) or not modality.get("global_rating_modality"):
-            modality = self.decide_capabilities(graph)
+        from jiuwenswarm.common.design_generation_selection import reuse_catalogue_snapshot
+        with reuse_catalogue_snapshot():
             meta = dict(graph.get("metadata") or {})
-        cast_notes = _cast_focus_alignment_patch(graph)
-        notes = _shot_distinctness_patch(graph)
-        consistency_notes = _spatial_continuity_patch(graph)
-        identity_notes = _identity_consistency_patch(graph)
-        spatial_notes = _spatial_geography_lock_patch(graph)
-        # Film-wide style/axis locks on every image + clip node.
-        try:
-            from jiuwenswarm.server.runtime.designer.pipeline.axis_locks import (
-                apply_axis_locks_to_graph,
-            )
-
-            axis_notes = apply_axis_locks_to_graph(graph)
-        except Exception:  # noqa: BLE001
-            axis_notes = []
-        # User-added canvas nodes → LLM agents + tools + contribution wiring.
-        try:
-            user_onboard = self.onboard_user_added_nodes(graph)
-            axis_notes.extend(
-                [f"user:{x}" for x in (user_onboard.get("notes") or []) if isinstance(x, str)][:20]
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        # Prune unused nodes + keep graph coherent for compose; stamp agents.
-        prune_notes = _director_prune_and_cohere(graph)
-        agent_notes = self._enforce_leaf_agents(graph)
-        # Re-apply audio agent policy after modality (backends may clear force_handler).
-        audio_assign = assign_audio_node_agents(graph)
-        # Second prune after audio assign (speech/music may be omitted).
-        prune_notes.extend(_director_prune_and_cohere(graph))
-        ensure_notes = self.ensure_agents_and_prune(graph)
-        rating_mod = str(
-            (modality or {}).get("global_rating_modality")
-            or meta.get("rating_modality")
-            or "text_only"
-        )
-        ack = {
-            "ok": True,
-            "patched": notes
-            + cast_notes
-            + consistency_notes
-            + identity_notes
-            + spatial_notes
-            + axis_notes
-            + prune_notes
-            + agent_notes
-            + list(ensure_notes.get("notes") or []),
-            "cast_focus_fixes": cast_notes,
-            "consistency_fixes": consistency_notes,
-            "identity_fixes": identity_notes,
-            "spatial_lock_fixes": spatial_notes,
-            "axis_lock_fixes": axis_notes,
-            "pruned_nodes": list(
-                dict.fromkeys(
-                    [x.split(":", 1)[-1] for x in prune_notes if x.startswith("pruned:")]
-                    + list(ensure_notes.get("pruned") or [])
+            modality = meta.get("modality_plan")
+            if not isinstance(modality, dict) or not modality.get("global_rating_modality"):
+                modality = self.decide_capabilities(graph)
+                meta = dict(graph.get("metadata") or {})
+            cast_notes = _cast_focus_alignment_patch(graph)
+            notes = _shot_distinctness_patch(graph)
+            consistency_notes = _spatial_continuity_patch(graph)
+            identity_notes = _identity_consistency_patch(graph)
+            spatial_notes = _spatial_geography_lock_patch(graph)
+            # Film-wide style/axis locks on every image + clip node.
+            try:
+                from jiuwenswarm.server.runtime.designer.pipeline.axis_locks import (
+                    apply_axis_locks_to_graph,
                 )
-            ),
-            "agent_enforcement": agent_notes,
-            "ensure_agents": ensure_notes,
-            "audio_assignment": audio_assign,
-            "rating_modality": rating_mod,
-            "can_vision": bool((modality or {}).get("can_vision")),
-            "can_video": bool((modality or {}).get("can_video")),
-            "can_speech": bool((modality or {}).get("can_speech")),
-            "can_music": bool((modality or {}).get("can_music")),
-            "notes": (
-                f"Director start validation: rating_modality={rating_mod}. "
-                f"Cast-focus={len(cast_notes)}. Consistency={len(consistency_notes)}. "
-                f"Identity={len(identity_notes)}. Spatial={len(spatial_notes)}. "
-                f"Prune/cohere={len(prune_notes)}. Agents={len(agent_notes)}. "
-                f"Ensure={len(ensure_notes.get('notes') or [])}. "
-                f"{str((modality or {}).get('reason') or '')[:400]}"
-            ),
-            "source": "structural",
-        }
-        meta = dict(graph.get("metadata") or {})
-        meta["director_plan_ack"] = ack
-        graph["metadata"] = meta
-        return ack
+
+                axis_notes = apply_axis_locks_to_graph(graph)
+            except Exception:  # noqa: BLE001
+                axis_notes = []
+            # User-added canvas nodes → LLM agents + tools + contribution wiring.
+            try:
+                user_onboard = self.onboard_user_added_nodes(graph)
+                axis_notes.extend(
+                    [f"user:{x}" for x in (user_onboard.get("notes") or []) if isinstance(x, str)][:20]
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # Prune unused nodes + keep graph coherent for compose; stamp agents.
+            prune_notes = _director_prune_and_cohere(graph)
+            agent_notes = self._enforce_leaf_agents(graph)
+            # Re-apply audio agent policy after modality (backends may clear force_handler).
+            audio_assign = assign_audio_node_agents(graph)
+            # Second prune after audio assign (speech/music may be omitted).
+            prune_notes.extend(_director_prune_and_cohere(graph))
+            ensure_notes = self.ensure_agents_and_prune(graph)
+            rating_mod = str(
+                (modality or {}).get("global_rating_modality")
+                or meta.get("rating_modality")
+                or "text_only"
+            )
+            ack = {
+                "ok": True,
+                "patched": notes
+                + cast_notes
+                + consistency_notes
+                + identity_notes
+                + spatial_notes
+                + axis_notes
+                + prune_notes
+                + agent_notes
+                + list(ensure_notes.get("notes") or []),
+                "cast_focus_fixes": cast_notes,
+                "consistency_fixes": consistency_notes,
+                "identity_fixes": identity_notes,
+                "spatial_lock_fixes": spatial_notes,
+                "axis_lock_fixes": axis_notes,
+                "pruned_nodes": list(
+                    dict.fromkeys(
+                        [x.split(":", 1)[-1] for x in prune_notes if x.startswith("pruned:")]
+                        + list(ensure_notes.get("pruned") or [])
+                    )
+                ),
+                "agent_enforcement": agent_notes,
+                "ensure_agents": ensure_notes,
+                "audio_assignment": audio_assign,
+                "rating_modality": rating_mod,
+                "can_vision": bool((modality or {}).get("can_vision")),
+                "can_video": bool((modality or {}).get("can_video")),
+                "can_speech": bool((modality or {}).get("can_speech")),
+                "can_music": bool((modality or {}).get("can_music")),
+                "notes": (
+                    f"Director start validation: rating_modality={rating_mod}. "
+                    f"Cast-focus={len(cast_notes)}. Consistency={len(consistency_notes)}. "
+                    f"Identity={len(identity_notes)}. Spatial={len(spatial_notes)}. "
+                    f"Prune/cohere={len(prune_notes)}. Agents={len(agent_notes)}. "
+                    f"Ensure={len(ensure_notes.get('notes') or [])}. "
+                    f"{str((modality or {}).get('reason') or '')[:400]}"
+                ),
+                "source": "structural",
+            }
+            meta = dict(graph.get("metadata") or {})
+            meta["director_plan_ack"] = ack
+            graph["metadata"] = meta
+            return ack
 
     @staticmethod
     def ensure_agents_and_prune(graph: DesignerExecutionGraph) -> dict[str, Any]:
@@ -3243,44 +3289,47 @@ class Director:
     @staticmethod
     def _enforce_leaf_agents(graph: DesignerExecutionGraph) -> list[str]:
         """Every leaf is an LLM agent with tools (uploads stay force_handler)."""
-        notes: list[str] = []
-        for node in graph.get("nodes") or []:
-            if not isinstance(node, dict):
-                continue
-            cfg = dict(node.get("config") or {})
-            nid = str(node.get("id") or "")
-            if not nid:
-                continue
-            cfg["kind"] = "agent"
-            tools = _tools_for_node(node)
-            if list(cfg.get("tools") or []) != tools:
-                notes.append(f"tools:{nid}")
-            cfg["tools"] = tools
-            if cfg.get("force_handler"):
-                cfg["delegate"] = "handler"
-                cfg["skip_llm"] = True
-                notes.append(f"force_handler:{nid}")
-            else:
-                cfg.pop("force_handler", None)
-                cfg.pop("skip_llm", None)
-                cfg["delegate"] = "agent"
-            try:
-                role_key = _role_key(node)
-                if role_key in {"clip", "video", "scene", "character"}:
-                    from jiuwenswarm.server.runtime.designer.pipeline.media_prompt_limits import (
-                        media_prompt_limit_packet,
-                        resolve_prompt_limit,
-                    )
+        from jiuwenswarm.common.design_generation_selection import reuse_catalogue_snapshot
+        with reuse_catalogue_snapshot():
+            notes: list[str] = []
+            for node in graph.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                cfg = dict(node.get("config") or {})
+                nid = str(node.get("id") or "")
+                if not nid:
+                    continue
+                cfg["kind"] = "agent"
+                tools = _tools_for_node(node)
+                if list(cfg.get("tools") or []) != tools:
+                    notes.append(f"tools:{nid}")
+                cfg["tools"] = tools
+                if cfg.get("force_handler"):
+                    cfg["delegate"] = "handler"
+                    cfg["skip_llm"] = True
+                    notes.append(f"force_handler:{nid}")
+                else:
+                    cfg.pop("force_handler", None)
+                    cfg.pop("skip_llm", None)
+                    cfg["delegate"] = "agent"
+                try:
+                    role_key = _role_key(node)
+                    if role_key in {"clip", "video", "scene", "character"}:
+                        from jiuwenswarm.server.runtime.designer.pipeline.media_prompt_limits import (
+                            media_prompt_limit_packet,
+                            resolve_prompt_limit,
+                        )
 
-                    kind = "video" if role_key in {"clip", "video"} else "image"
-                    lim = resolve_prompt_limit(kind)
-                    cfg["prompt_char_limit"] = lim.max_chars
-                    cfg["prompt_limit_guidance"] = lim.guidance()
-                    cfg.setdefault("media_prompt_limits", media_prompt_limit_packet())
-            except Exception:  # noqa: BLE001
-                pass
-            node["config"] = cfg
-        return notes
+                        kind = "video" if role_key in {"clip", "video"} else "image"
+                        lim = resolve_prompt_limit(kind)
+                        cfg["prompt_char_limit"] = lim.max_chars
+                        cfg["prompt_limit_guidance"] = lim.guidance()
+                        if "media_prompt_limits" not in cfg:
+                            cfg["media_prompt_limits"] = media_prompt_limit_packet()
+                except Exception:  # noqa: BLE001
+                    pass
+                node["config"] = cfg
+            return notes
 
     async def review_brief(
         self, graph: DesignerExecutionGraph
@@ -4145,7 +4194,10 @@ def _heuristic_node_score(
 
 def _shot_distinctness_patch(graph: DesignerExecutionGraph) -> list[str]:
     """Ensure each clip has a unique clip_action + generate prompt (text-only)."""
-    from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import shot_brief_prompt
+    from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import (
+        clip_scene_label,
+        shot_brief_prompt,
+    )
 
     notes: list[str] = []
     camera_cycle = (
@@ -4179,7 +4231,13 @@ def _shot_distinctness_patch(graph: DesignerExecutionGraph) -> list[str]:
         if not lock and action:
             cfg["continuity_lock"] = _infer_continuity_lock(action)
         if not prompt or (marker not in prompt.lower() and f"第{idx}镜" not in prompt):
-            gen["prompt"] = shot_brief_prompt(idx, camera=camera, action=action, cast_names=cast_names)
+            gen["prompt"] = shot_brief_prompt(
+                idx,
+                camera=camera,
+                action=action,
+                cast_names=cast_names,
+                scene=clip_scene_label(cfg),
+            )
             cfg["generate"] = gen
             notes.append(f"{node.get('id')}: refreshed generate.prompt")
         if role == "clip":

@@ -45,8 +45,7 @@ import sys
 import agent_gateway
 from jiuwenswarm.server.runtime.skill.skill_manager import SkillManager
 import subprocess
-from websockets.legacy.client import connect
-from tests.unit_tests.agentserver.fixtures.front_process import free_port, receive, seed, terminate_owned
+from tests.unit_tests.agentserver.fixtures.front_process import connect_front, free_port, receive, seed, terminate_owned
 from jiuwenswarm.agents.harness.team.config_loader import load_team_spec_dict
 from openjiuwen.core.foundation.llm import ToolMessage
 from jiuwenswarm.agents.harness.common.session_ops_service import _build_context_messages_from_history
@@ -80,7 +79,7 @@ from jiuwenswarm.server.worker import runtime_backend
 
 def _gateway_process(connection, directory):
     async def run():
-        from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
+        from jiuwenswarm.common.e2a.request_wire import e2a_from_agent_fields
         from e2a.wire_codec import parse_agent_server_wire_chunk
         from jiuwenswarm.common.schema.message import ReqMethod
         from agent_gateway.cron.controller import CronController
@@ -104,7 +103,19 @@ def _gateway_process(connection, directory):
         )
         handler._cron_controller = controller
 
-        async def ack(*, command_id, data, user_id=None, session_id=None):
+        # Cron058 后真实 _push_cron_command_ack 会多传 group_id/bot_id；
+        # mock 必须吞掉，否则子进程 TypeError → pipe EOF，本用例失败。
+        async def ack(
+            *,
+            command_id,
+            data,
+            user_id=None,
+            session_id=None,
+            group_id=None,
+            bot_id=None,
+            **_kwargs,
+        ):
+            _ = (session_id, group_id, bot_id, _kwargs)
             envelope = e2a_from_agent_fields(
                 request_id=command_id, channel_id="", req_method=ReqMethod.CRON_COMMAND_ACK,
                 params={"command_id": command_id, "data": data}, user_id=user_id,
@@ -688,15 +699,7 @@ async def test_native_front_control_queries_do_not_load_runtime_dependencies(tmp
                                    cwd=root, env=env, stdout=log, stderr=log)
         ws = None
         try:
-            for _ in range(400):
-                try:
-                    ws = await connect(f"ws://127.0.0.1:{port}")
-                    acknowledgement = json.loads(await ws.recv())
-                    assert acknowledgement.get("event") == "connection.ack"
-                    break
-                except OSError:
-                    await asyncio.sleep(.01)
-            assert ws is not None
+            ws = await connect_front(process, port, tmp_path / "front.log", timeout=60.0)
             for method, params in (("session.list", {}), ("project.list", {}), ("config.get", {}),
                                    ("history.get", {"session_id": "acceptance-0", "page_idx": 1})):
                 await ws.send(json.dumps({"request_id": method, "channel_id": "web", "req_method": method,
@@ -735,9 +738,21 @@ def team_config(language):
 
 @pytest.mark.parametrize('language, expected', [('zh', 'cn'), (' ZH ', 'cn'), ('cn', 'cn'), ('en', 'en')])
 def test_team_config_uses_core_language(language, expected, monkeypatch):
-    monkeypatch.setenv('AGENT_PROMPT_LANGUAGE', 'en')
+    """Harness language follows request memo (simulated UI preference), not config_base alone."""
+    from jiuwenswarm.enterprise.config import preferred_language as pref
+
+    # Memo is enterprise-only; personal edition always falls back to yaml.
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    monkeypatch.setenv("GATEWAY_DB_TYPE", "mariadb")
+    monkeypatch.setenv("GATEWAY_DB_HOST", "db.internal")
+    monkeypatch.setenv("GATEWAY_DB_PORT", "3306")
+    monkeypatch.setenv("GATEWAY_DB_USER", "root")
+    monkeypatch.setenv("GATEWAY_DB_PASSWORD", "p@ss")
+    monkeypatch.setenv("GATEWAY_DB_NAME", "gw")
+
     config = team_config(language)
-    spec = load_team_spec_dict(config_base=config)
+    with pref.bind_preferred_language_memo(user_id="test", language=language):
+        spec = load_team_spec_dict(config_base=config)
     assert spec['language'] == expected
     assert config['preferred_language'] == language
 

@@ -12,12 +12,13 @@ the session directory (pod recycled).
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
+
+import portalocker
 
 if TYPE_CHECKING:
     from jiuwenswarm.enterprise.team.control_store import OwnerIdentity
@@ -57,6 +58,7 @@ def _purge_mysql(
     team_name: str,
     owner_user_id: str,
     require_owner: bool,
+    session_only: bool = False,
 ) -> str | None:
     """Read and delete team rows in one MySQL call, then drop the local binding."""
     from sqlalchemy import text
@@ -145,7 +147,7 @@ def _purge_mysql(
                     binding_sid = _clean(binding.get("team_session_id"))
                     binding_tid = _clean(binding.get("team_id"))
                     team_id = team_id or binding_tid
-            if not binding_tid and team_id:
+            if not binding_tid and team_id and not session_only:
                 binding = (
                     await conn.execute(
                         text(
@@ -188,7 +190,7 @@ def _purge_mysql(
                 )
                 return False, None
 
-            if entity_id:
+            if entity_id and not session_only:
                 await conn.execute(
                     text(
                         "UPDATE team_entity SET status=:status, updated_at=:now "
@@ -204,7 +206,7 @@ def _purge_mysql(
                     text("DELETE FROM team_entity WHERE team_id=:tid"),
                     {"tid": entity_id},
                 )
-            if team_id:
+            if team_id and not session_only:
                 await conn.execute(
                     text("DELETE FROM team_quota_lease WHERE team_id=:tid"),
                     {"tid": team_id},
@@ -222,7 +224,11 @@ def _purge_mysql(
                     text("DELETE FROM team_route_binding WHERE team_session_id=:sid"),
                     {"sid": session_id},
                 )
-            extra_sid = binding_sid if binding_sid and binding_sid != session_id else ""
+            extra_sid = (
+                binding_sid
+                if binding_sid and binding_sid != session_id and not session_only
+                else ""
+            )
             if extra_sid:
                 await conn.execute(
                     text("DELETE FROM team_route_binding WHERE team_session_id=:sid"),
@@ -276,6 +282,7 @@ def purge_team_for_deleted_session(
     team_name: str = "",
     owner_user_id: str = "",
     require_owner: bool = False,
+    session_only: bool = False,
 ) -> str | None:
     """Remove team occupancy for a deleted Session. Idempotent.
 
@@ -285,6 +292,11 @@ def purge_team_for_deleted_session(
     ``owner_user_id`` matches the entity / create-lease / route-binding owner.
     Gateway uses this for leftover rows after a PG ownership miss so knowing a
     ``session_id`` cannot wipe another user's team tables.
+
+    ``session_only`` removes only this Session's create lease, route binding and
+    local binding. A team delete that failed for some Sessions keeps the team
+    entity and the surviving Sessions' leases/bindings; purging them by
+    ``team_id`` would orphan the survivors.
     """
     sid = _clean(session_id)
     name = _clean(team_name)
@@ -307,6 +319,7 @@ def purge_team_for_deleted_session(
             team_name=name,
             owner_user_id=caller,
             require_owner=require_owner,
+            session_only=session_only,
         )
 
     entity = None
@@ -397,7 +410,7 @@ def purge_team_for_deleted_session(
             get_team_control_store,
         )
 
-        if entity is not None:
+        if entity is not None and not session_only:
             store = get_team_control_store()
             store.set_status(entity.team_id, TEAM_STATUS_DELETED)
             store.delete_entity(entity.team_id)
@@ -412,7 +425,9 @@ def purge_team_for_deleted_session(
     try:
         from jiuwenswarm.enterprise.team.quota import get_team_quota_service
 
-        get_team_quota_service().drop_occupancy(session_id=sid, team_id=team_id)
+        get_team_quota_service().drop_occupancy(
+            session_id=sid, team_id=team_id, session_only=session_only,
+        )
     except Exception:  # noqa: BLE001
         logger.warning(
             "[TeamCleanup] failed to drop quota leases: session_id=%s team_id=%s",
@@ -422,6 +437,17 @@ def purge_team_for_deleted_session(
         )
 
     try:
+        from jiuwenswarm.enterprise.edition import is_enterprise
+
+        if is_enterprise():
+            from jiuwenswarm.enterprise.team.member_limits import clear_swarmflow_worker_quota
+
+            # Drop the in-process swarmflow quota registration with the team.
+            clear_swarmflow_worker_quota(session_id=sid, team_name=name)
+    except Exception:  # noqa: BLE001
+        logger.debug("[TeamCleanup] failed to clear swarmflow quota", exc_info=True)
+
+    try:
         from jiuwenswarm.enterprise.team.route_binding_store import (
             get_team_route_binding_store,
         )
@@ -429,7 +455,7 @@ def purge_team_for_deleted_session(
         route_store = get_team_route_binding_store()
         if sid:
             route_store.delete(sid)
-        if team_id:
+        if team_id and not session_only:
             deleter = getattr(route_store, "delete_by_team_id", None)
             if callable(deleter):
                 deleter(team_id)
@@ -495,13 +521,18 @@ def _owner_session_dir(owner: OwnerIdentity, session_id: str) -> Path:
 @contextmanager
 def _sweep_lock(volume: Path) -> Iterator[None]:
     """One AgentServer replica sweeps at a time. The purge itself is idempotent."""
-    handle = open(volume / _SWEEP_LOCK_NAME, "a+")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+    with (volume / _SWEEP_LOCK_NAME).open("a+") as handle:
+        while True:
+            try:
+                portalocker.lock(handle, portalocker.LOCK_EX)
+                break
+            except portalocker.AlreadyLocked:
+                # Windows blocking byte-range locks have a finite retry period.
+                continue
+        try:
+            yield
+        finally:
+            portalocker.unlock(handle)
 
 
 def reconcile_teams_with_sessions(*, identity: OwnerIdentity | None = None) -> int:

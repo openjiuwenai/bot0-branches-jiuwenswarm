@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from agent_gateway.common.mode_matrix import is_team_mode
+
 from jiuwenswarm.common.schema.agent import AgentResponse
 from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.server.context import RequestContext
@@ -514,27 +515,39 @@ async def handle_team_delete(ctx: RequestContext) -> None:
                 team_name=team_name,
                 channel_id=request.channel_id,
             )
-            if result.deleted:
-                try:
-                    from jiuwenswarm.enterprise.team.session_cleanup import (
-                        purge_team_for_deleted_session,
-                    )
+            # Sessions that were deleted must drop their team and quota rows even
+            # when another Session of the same team failed. A partial delete keeps
+            # the team entity for the survivors, so only the removed Sessions'
+            # own rows are purged; the name fallback is safe on a full delete.
+            session_only = not result.deleted
+            purges: list[tuple[str, str]] = [(sid, "") for sid in result.session_ids]
+            if not purges and result.deleted:
+                purges = [("", team_name)]
+            try:
+                from jiuwenswarm.enterprise.team.session_cleanup import (
+                    purge_team_for_deleted_session,
+                )
 
-                    from jiuwenswarm.infrastructure.db.team_store_actor import run_team_store
-
-                    for sid in result.session_ids:
+                from jiuwenswarm.infrastructure.db.team_store_actor import run_team_store
+            except Exception:
+                logger.exception("[Team] quota release after delete failed: %s", team_name)
+            else:
+                for sid, purge_name in purges:
+                    try:
                         await run_team_store(
                             purge_team_for_deleted_session,
                             session_id=sid,
-                            team_name=team_name,
+                            team_name=purge_name,
+                            session_only=session_only,
                         )
-                    if not result.session_ids:
-                        await run_team_store(
-                            purge_team_for_deleted_session,
-                            team_name=team_name,
+                    except Exception:
+                        logger.exception(
+                            "[Team] quota release after delete failed: %s "
+                            "session_id=%s team_name=%s",
+                            team_name,
+                            sid or "-",
+                            purge_name or "-",
                         )
-                except Exception:
-                    logger.exception("[Team] quota release after delete failed: %s", team_name)
             payload = {
                 "team_name": result.team_name,
                 "session_ids": list(result.session_ids),
@@ -566,20 +579,34 @@ async def handle_team_delete(ctx: RequestContext) -> None:
     await ctx.sink.send_response(resp)
 
 
-async def handle_team_snapshot(ctx: RequestContext) -> None:
-    request = ctx.request
+def _snapshot_tasks(payload: dict[str, Any] | None) -> list[Any]:
+    if not isinstance(payload, dict):
+        return []
+    tasks = payload.get("tasks")
+    return tasks if isinstance(tasks, list) else []
+
+
+async def resolve_team_snapshot(
+    *,
+    session_id: str,
+    requested_team_name: str,
+    channel_id: str,
+    get_session_metadata_fn: Callable[[str], dict[str, Any] | None] | None = None,
+) -> tuple[dict[str, Any] | None, str, bool | None]:
+    """Resolve one ``team.snapshot`` board for every transport entry point.
+
+    A session can host several teams while ``TeamManager`` keeps only the last
+    monitor per session, so a live board is accepted only when it matches the
+    requested team. Prefer a scoped live monitor, then fall back to ``team.db``.
+    A live board whose roster is still empty is topped up from ``team.db`` and
+    reported as ``live+db`` so the right-side panel stops being empty.
+
+    Returns ``(snapshot, members_source, runtime_available)``.
+    """
     from jiuwenswarm.agents.harness.team import get_team_manager
     from jiuwenswarm.agents.harness.team.handlers.team_monitor_handler import (
         TeamMonitorHandler,
     )
-
-    params = request.params if isinstance(request.params, dict) else {}
-    session_id = str(params.get("session_id") or request.session_id or "").strip()
-    channel_id = request.channel_id or "web"
-    empty_payload = {"members": [], "tasks": [], "team_id": None}
-    # team_name 是调用方点名要看的团队。一个会话可以同时挂多个团队，
-    # 会话级看板只记住最后一个。对不上就不要把别的团队画上来。
-    requested_team_name = str(params.get("team_name") or "").strip()
 
     team_manager = get_team_manager(channel_id)
     monitor_handler = team_manager.get_monitor_handler(session_id) if session_id else None
@@ -592,6 +619,7 @@ async def handle_team_snapshot(ctx: RequestContext) -> None:
 
     snapshot: dict[str, Any] | None = None
     source = "empty"
+    runtime_available: bool | None = True if live_matches_request else None
     if live_matches_request:
         try:
             snapshot = await monitor_handler.get_team_snapshot()
@@ -600,21 +628,28 @@ async def handle_team_snapshot(ctx: RequestContext) -> None:
         except Exception as e:  # noqa: BLE001
             logger.warning("[AgentWebSocketServer] team.snapshot (live) failed: %s", e)
 
-    def _snapshot_tasks(payload: dict[str, Any] | None) -> list[Any]:
-        if not isinstance(payload, dict):
-            return []
-        tasks = payload.get("tasks")
-        return tasks if isinstance(tasks, list) else []
-
-    # 点名的团队还活着，但会话级看板不是它：另开一个只读看板读一次，用完就丢。
-    if snapshot is None and requested_team_name and session_id:
+    # Resolve one exact identity for the runtime probe and DB fallback.
+    # A session monitor may belong to another Team; a replacement worker
+    # may have none. Probe only when the matching live board is missing.
+    snapshot_team_name = requested_team_name
+    if not snapshot_team_name and session_id:
+        snapshot_team_name = str(team_manager.get_active_team_name(session_id) or "").strip()
+        if not snapshot_team_name:
+            metadata_getter = get_session_metadata_fn or _server_global("get_session_metadata")
+            snapshot_team_name = str(
+                (metadata_getter(session_id) or {}).get("team_name") or ""
+            ).strip()
+    if snapshot is None and snapshot_team_name and session_id:
         try:
             from openjiuwen.core.runner.runner import GLOBAL_RUNNER
 
             scoped_monitor = await GLOBAL_RUNNER.get_agent_team_monitor(
-                team_name=requested_team_name,
+                team_name=snapshot_team_name,
                 session_id=session_id,
             )
+            if runtime_available is None:
+                # A running session monitor already proved the runtime is up.
+                runtime_available = scoped_monitor is not None
             if scoped_monitor is not None:
                 scoped_snapshot = await TeamMonitorHandler(scoped_monitor, session_id).get_team_snapshot()
                 if scoped_snapshot is not None:
@@ -625,7 +660,7 @@ async def handle_team_snapshot(ctx: RequestContext) -> None:
                 "[AgentWebSocketServer] team.snapshot (scoped live) failed: "
                 "session_id=%s team_name=%s error=%s",
                 session_id,
-                requested_team_name,
+                snapshot_team_name,
                 e,
             )
 
@@ -636,15 +671,7 @@ async def handle_team_snapshot(ctx: RequestContext) -> None:
     # title/content. Fall back whenever live has no tasks.
     needs_db = snapshot is None or not _snapshot_tasks(snapshot)
     if needs_db and session_id:
-        team_name = requested_team_name
-        if not team_name:
-            team_name = str(
-                team_manager.get_active_team_name(session_id) or ""
-            ).strip()
-        if not team_name:
-            team_name = str(
-                (_server_global("get_session_metadata")(session_id) or {}).get("team_name") or ""
-            ).strip()
+        team_name = snapshot_team_name
         if team_name:
             try:
                 db_snapshot = await TeamMonitorHandler.get_team_snapshot_from_db(
@@ -665,22 +692,92 @@ async def handle_team_snapshot(ctx: RequestContext) -> None:
             if db_snapshot is not None and (
                 snapshot is None or _snapshot_tasks(db_snapshot)
             ):
-                snapshot = db_snapshot
+                # A DB board without members must not drop the live members.
+                if not db_snapshot.get("members") and snapshot is not None:
+                    snapshot = {**db_snapshot, "members": snapshot.get("members") or []}
+                else:
+                    snapshot = db_snapshot
                 source = "db"
 
+    # Roster rows are written before ``team.runtime_ready`` while tasks may
+    # already be on the live board, so a live snapshot can carry tasks and no
+    # members. Top up the roster from DB separately instead of leaving the
+    # right-side panel empty until the next page refresh.
+    live_roster_empty = (
+        snapshot is not None
+        and not snapshot.get("members")
+        and source in ("live", "live-scoped")
+    )
+    if live_roster_empty and session_id and snapshot_team_name:
+        try:
+            db_members = await TeamMonitorHandler.get_member_list_from_db(
+                snapshot_team_name, exclude_leader=True
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[AgentWebSocketServer] team.snapshot (db members) failed: "
+                "session_id=%s team_name=%s error=%s",
+                session_id,
+                snapshot_team_name,
+                e,
+            )
+            db_members = None
+        if db_members:
+            snapshot = {**snapshot, "members": db_members}
+            source = "live+db"
+
+    return snapshot, source, runtime_available
+
+
+async def handle_team_snapshot(ctx: RequestContext) -> None:
+    request = ctx.request
+    params = request.params if isinstance(request.params, dict) else {}
+    session_id = str(params.get("session_id") or request.session_id or "").strip()
+    channel_id = request.channel_id or "web"
+    empty_payload = {"members": [], "tasks": [], "team_id": None}
+    # team_name 是调用方点名要看的团队。一个会话可以同时挂多个团队，
+    # 会话级看板只记住最后一个。对不上就不要把别的团队画上来。
+    requested_team_name = str(params.get("team_name") or "").strip()
+
+    snapshot, source, runtime_available = await resolve_team_snapshot(
+        session_id=session_id,
+        requested_team_name=requested_team_name,
+        channel_id=channel_id,
+    )
+
+    # A replacement worker can read the old DB's busy/running rows without
+    # having restored any TeamAgent. Do not mutate those historical rows or
+    # infer completion from a ready worker. Expose the independent runtime
+    # probe and whether unfinished work needs an explicit recovery action.
+    unfinished = any(
+        isinstance(task, dict)
+        and task.get("status")
+        and task["status"] not in {"completed", "cancelled", "failed"}
+        for task in _snapshot_tasks(snapshot)
+    )
+    recovery_required = (
+        False if runtime_available else (
+            None if runtime_available is None or snapshot is None else unfinished
+        )
+    )
     payload = {
         **(snapshot or empty_payload),
         "members_source": source if snapshot is not None else "empty",
+        "members_live": source in {"live", "live-scoped"},
+        "runtime_available": runtime_available,
+        "recovery_required": recovery_required,
     }
     members = payload.get("members") if isinstance(payload, dict) else []
     tasks = _snapshot_tasks(payload if isinstance(payload, dict) else None)
     logger.info(
         "[AgentWebSocketServer] team.snapshot session_id=%s source=%s "
-        "tasks_count=%s members_count=%s",
+        "tasks_count=%s members_count=%s runtime_available=%s recovery_required=%s",
         session_id or "-",
         source if snapshot is not None else "empty",
         len(tasks),
         len(members) if isinstance(members, list) else 0,
+        runtime_available,
+        recovery_required,
     )
 
     resp = AgentResponse(

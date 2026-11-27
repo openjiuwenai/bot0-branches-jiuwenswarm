@@ -180,26 +180,46 @@ export function isBuiltinSkill(skill: Pick<SkillItem, 'source_type' | 'source'>)
 
 /**
  * 不展示编辑、卸载的技能（发布见 shouldShowSkillPublish）。
- * - 预置：各版本均管理员托管
- * - 内置：仅企业版托管；个人版与 origin/develop 一致，可编辑/卸载
- * （后端也会拒绝对应 uninstall；启停见 shouldShowEnableSwitch。）
+ * 预置和内置在各版本都由产品托管，不提供编辑和卸载。
+ * 启停见 shouldShowEnableSwitch。
  */
 export function isAdminManagedSkill(
   skill: Pick<SkillItem, 'source_type' | 'source'>,
-  enterpriseEdition = false,
+  _enterpriseEdition = false,
 ): boolean {
   if (isPrebuiltSkill(skill)) return true;
-  return enterpriseEdition && isBuiltinSkill(skill);
+  return isBuiltinSkill(skill);
+}
+
+/**
+ * 通过「上传 Skill」安装的技能。
+ * 企业版直传安装账本写入 ``origin=file-api:upload``；同名再上传会覆盖为同一值。
+ */
+export function isUploadedSkill(skill: Pick<SkillItem, 'origin'>): boolean {
+  return String(skill.origin || '').trim() === 'file-api:upload';
+}
+
+/**
+ * 企业版「上传本地 Skill」入口门禁：只有当前 Agent 配置模板显式开启时才允许。
+ * 服务端强制校验在 agent-gateway（upload_local_skill 策略），此处仅控制入口展示。
+ */
+export function canUploadLocalSkill(
+  enterpriseEdition: boolean,
+  allowLocalSkillUpload: boolean | undefined,
+): boolean {
+  return enterpriseEdition && allowLocalSkillUpload === true;
 }
 
 /**
  * 是否展示技能详情「发布」入口。
- * 与编辑/卸载一致：非管理员托管技能可发布（企业版仅屏蔽 prebuilt/builtin）。
+ * - 与编辑/卸载一致：预置和内置不提供发布。
+ * - 企业版：通过「上传 Skill」安装的技能不展示发布入口。
  */
 export function shouldShowSkillPublish(
-  skill: Pick<SkillItem, 'source_type' | 'source'>,
+  skill: Pick<SkillItem, 'source_type' | 'source' | 'origin'>,
   enterpriseEdition: boolean,
 ): boolean {
+  if (enterpriseEdition && isUploadedSkill(skill)) return false;
   return !isAdminManagedSkill(skill, enterpriseEdition);
 }
 

@@ -3,13 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import ast
-from importlib.util import find_spec
-import logging
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-import uuid
 
 import pytest
 
@@ -135,7 +130,7 @@ async def test_config_save_refreshes_persistent_models_without_starting_a_runtim
 
 @pytest.mark.asyncio
 async def test_model_reload_does_not_create_persistent_data_for_personal_agents(tmp_path, monkeypatch):
-    monkeypatch.setattr("jiuwenswarm.server.jiuwenmate.service.default_data_dir", lambda: tmp_path / "absent")
+    monkeypatch.setattr("jiuwenswarm.common.paths.get_jiuwenmate_dir", lambda: tmp_path / "absent")
     server = SimpleNamespace(
         _agent_manager=SimpleNamespace(reload_agents_config=AsyncMock()),
         _jiuwenmate_web=JiuwenMateWebAdapter(),
@@ -180,7 +175,7 @@ async def test_model_reload_opens_an_existing_persistent_store_once(tmp_path, mo
         created.append(service)
         return service
 
-    monkeypatch.setattr("jiuwenswarm.server.jiuwenmate.service.default_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("jiuwenswarm.common.paths.get_jiuwenmate_dir", lambda: tmp_path)
     adapter = JiuwenMateWebAdapter(service_factory=service_factory)
     server = SimpleNamespace(
         _agent_manager=SimpleNamespace(reload_agents_config=AsyncMock()),
@@ -257,7 +252,7 @@ async def test_explicit_reload_updates_persistent_models_or_reports_unapplied_dr
 @pytest.mark.asyncio
 async def test_persistent_refresh_exception_returns_unapplied_without_creating_a_runtime(tmp_path, monkeypatch):
     (tmp_path / "agents.sqlite3").touch()
-    monkeypatch.setattr("jiuwenswarm.server.jiuwenmate.service.default_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("jiuwenswarm.common.paths.get_jiuwenmate_dir", lambda: tmp_path)
 
     def unavailable_service():
         raise RuntimeError("store unavailable")
@@ -310,10 +305,9 @@ async def test_proxied_model_save_notifies_persistent_agents_with_the_saved_conf
 
 @pytest.mark.asyncio
 async def test_partial_persistent_reload_does_not_retry_or_restart_the_gateway():
-    # Execute the real nested save callback without constructing the Gateway.
-    source = Path(find_spec("agent_gateway.app_gateway").origin)
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    callback = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_on_config_saved")
+    # Execute the real config-saved coordinator without constructing the Gateway.
+    from agent_gateway.application.config_saved_effects import ConfigSavedEffectCoordinator
+
     response = parse_agent_server_wire_unary(encode_agent_response_for_wire(AgentResponse(
         request_id="model-reload", channel_id="web", ok=False,
         payload={"code": "PERSISTENT_MODELS_NOT_APPLIED", "error": "unpublished edits"},
@@ -323,13 +317,15 @@ async def test_partial_persistent_reload_does_not_retry_or_restart_the_gateway()
         send_request=AsyncMock(return_value=response),
     )
     restart = Mock()
-    scope = {
-        "Any": object, "client": client, "ReqMethod": ReqMethod, "uuid_module": uuid,
-        "e2a_from_agent_fields": lambda **fields: fields, "logger": logging.getLogger(__name__),
-        "_schedule_gateway_restart": restart, "restart_request": object(), "asyncio": asyncio,
-    }
-    exec(compile(ast.Module(body=[callback], type_ignores=[]), str(source), "exec"), scope)
+    callback = ConfigSavedEffectCoordinator(
+        client=client,
+        schedule_prewarm=Mock(),
+        sync_proactive_tick=AsyncMock(),
+        schedule_channel_snapshot=Mock(),
+        schedule_restart=restart,
+        spawn_background=Mock(),
+    )
 
-    assert await scope["_on_config_saved"]({"models.defaults"}, config_payload=model_payload(131072)) is False
+    assert await callback({"models.defaults"}, config_payload=model_payload(131072)) is False
     assert client.send_request.await_count == 1
     restart.assert_not_called()

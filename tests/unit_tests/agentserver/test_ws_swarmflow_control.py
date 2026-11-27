@@ -9,6 +9,8 @@ from types import SimpleNamespace  # noqa: F401  (kept for parity with sibling t
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from jiuwenswarm.common.schema.agent import AgentRequest
 from jiuwenswarm.common.schema.message import ReqMethod
 

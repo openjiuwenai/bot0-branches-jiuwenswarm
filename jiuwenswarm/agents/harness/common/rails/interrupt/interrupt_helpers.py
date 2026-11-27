@@ -191,6 +191,7 @@ def build_permission_rail(
     browser_runtime_security_profile: Any = None,
     trusted_search_urls: Any = None,
     channel_id: str = "",
+    session_artifact_paths: Any = None,
 ) -> Any | None:
     """Build openjiuwen PermissionInterruptRail for tool permission checks.
 
@@ -241,6 +242,7 @@ def build_permission_rail(
 
     from jiuwenswarm.agents.harness.common.a4p.preflight import unregister_preflight_rail
 
+    bound_channel_id = str(channel_id or "").strip()
     if session_id:
         unregister_preflight_rail(str(session_id).strip())
     inline_permissions = config.get("permissions", {})
@@ -426,8 +428,8 @@ def build_permission_rail(
             )
             channel = (
                 execution_context.channel_id
-                if execution_context is not None
-                else (TOOL_PERMISSION_CHANNEL_ID.get() or "web")
+                if execution_context is not None and execution_context.channel_id
+                else (TOOL_PERMISSION_CHANNEL_ID.get() or bound_channel_id or "web")
             )
 
             tool_call = req.tool_call
@@ -616,6 +618,16 @@ def build_permission_rail(
                             attempt,
                             verification_error=f"A4P token verification failed: {exc}",
                         )
+
+                # Cron is unattended: never fall through to interactive "interrupt".
+                # Without an A4P token path above, ask must fail closed regardless of
+                # permissions.mode — cron sessions do not install a Smart Approval
+                # LLM rail, so "auto" cannot decide; waiting for HITL would hang.
+                if is_cron:
+                    return _deny_cron_scope(
+                        "定时任务无法使用交互式审批；"
+                        "ask 需有效 A4P cron intent token，或将工具设为 allow/deny"
+                    )
 
             if channel != "acp":
                 return "interrupt"
@@ -987,9 +999,6 @@ def build_permission_rail(
                     auto_reviewer = AutoReviewer(
                         client=IsolatedModelReviewerClient(
                             model=reviewer_model,
-                            display_language_getter=lambda: get_config().get(
-                                "preferred_language", "zh"
-                            ),
                         ),
                         timeout_ms=auto_options["reviewer_timeout_ms"],
                         reviewer_output_format=auto_options["reviewer_output_format"],
@@ -1010,6 +1019,7 @@ def build_permission_rail(
                 browser_runtime_security_profile=browser_runtime_security_profile,
                 trusted_search_urls=trusted_search_urls,
                 written_permissions=_get_written_permissions,
+                session_artifact_paths=session_artifact_paths,
             )
             permission_rail.set_trusted_dirs(None)
 

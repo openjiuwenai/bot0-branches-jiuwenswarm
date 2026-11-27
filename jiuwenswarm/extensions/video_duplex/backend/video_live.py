@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Any
 import uuid
 
-from agent_gateway.common.protocol_methods import ReqMethod
-
+from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.common.utils import append_jsonl_log, get_user_workspace_dir
 from jiuwenswarm.extensions.video_duplex.backend.error_details import duplex_failure
 from jiuwenswarm.extensions.video_duplex.backend import (
@@ -551,6 +550,11 @@ def register_video_live_handler(
                     }
                     result = {**result, "delegation": call.task}
                     break
+                if call.name == "jiuwen_task_answer" and scope.startswith("task-duplex:"):
+                    # The original browser question controller owns validation and submission.
+                    result = {**result, "decision": "response", "response": "", "delegation": "",
+                              "interaction_answer": call.arguments}
+                    break
                 receipt = await search_manager.operate(
                     owner, scope, call, ws=ws, approvals_only=True, user_instruction=question or instruction,
                 )
@@ -619,6 +623,7 @@ def register_video_live_handler(
                 "timing": result.get("timing"),
                 "tools_used": tools_used,
                 "search_job": search_job,
+                **({"interaction_answer": result["interaction_answer"]} if result.get("interaction_answer") else {}),
                 **({"queue_management": queue_management} if queue_management is not None else {}),
             },
         )
@@ -629,6 +634,7 @@ def register_video_live_handler(
             payload={
                 "response": result.get("response"),
                 "search_job": search_job,
+                **({"interaction_answer": result["interaction_answer"]} if result.get("interaction_answer") else {}),
                 **({"queue_management": queue_management} if queue_management is not None else {}),
             },
         )
@@ -840,15 +846,13 @@ def register_video_live_handler(
         )
 
     async def _core_receipts(ws, req_id, params, session_id):
-        from jiuwenswarm.common.schema.message import ReqMethod as CoreReqMethod
-
         from .task_adapter import task_identity
 
         try:
             owner, scope = task_identity(ws, str((params or {}).get("search_session_id") or ""))
             if not scope.startswith("task-duplex:"):
                 raise ValueError("Core receipts require a saved conversation")
-            payload = await task_agent_query(agent_client, CoreReqMethod.VOICE_SESSION_RECEIPTS,
+            payload = await task_agent_query(agent_client, ReqMethod.VOICE_SESSION_RECEIPTS,
                 {"token": params.get("token"), "action": params.get("action")},
                 scope.removeprefix("task-duplex:"), owner)
             await channel.send_response(ws, req_id, ok=True, payload=payload)

@@ -15,6 +15,8 @@ from typing import Any
 
 from agent_gateway.common.work_mode import DEFAULT_WEB_WORK_MODE
 
+from jiuwenswarm.runtime.app_role import is_npc_session
+
 
 def session_type_from_metadata(meta: dict[str, Any]) -> str:
     """Keep conversation type independent of the agent/team execution mode."""
@@ -40,6 +42,7 @@ def to_session_info(meta: dict[str, Any]) -> dict[str, Any]:
         "message_count": int(meta.get("message_count", 0)),
         "mode": str(meta.get("mode", "unknown")),
         "type": session_type_from_metadata(meta),
+        **({"npc_session": True} if is_npc_session(meta) else {}),
         "team_name": str(meta.get("team_name", "")),
         "agent_group_name": str(meta.get("agent_group_name", "")),
         "pinned": bool(meta.get("pinned", False)),
@@ -60,4 +63,7 @@ def to_session_info(meta: dict[str, Any]) -> dict[str, Any]:
         "lifecycle_operation": meta.get("lifecycle_operation"),
         "execution_blocked": bool(meta.get("execution_blocked", False)),
         "stop_pending": bool(meta.get("stop_pending", False)),
+        # 损坏 metadata 的会话在列表层被打标（见 get_all_sessions_metadata），
+        # 投影必须透传，否则 Web/网关消费方永远拿不到，标记只在后端日志生效。
+        "metadata_corrupted": bool(meta.get("metadata_corrupted", False)),
     }

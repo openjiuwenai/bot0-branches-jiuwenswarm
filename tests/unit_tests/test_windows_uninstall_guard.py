@@ -3,14 +3,19 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
 import uuid
 
+import psutil
 import pytest
 
 
@@ -29,6 +34,15 @@ def exe_entry():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_mixed_restore_arguments_cannot_dispatch_init(exe_entry, monkeypatch):
+    init_main = Mock()
+    monkeypatch.setitem(sys.modules, "jiuwenswarm.init_workspace", SimpleNamespace(main=init_main))
+    monkeypatch.setattr(sys, "argv", ["workswarm.exe", "init", "--force", "--desktop-restore-upgrade-config"])
+    with pytest.raises(ValueError, match="restore does not accept arguments"):
+        exe_entry._dispatch()
+    init_main.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -51,8 +65,66 @@ def test_mutex_covers_desktop_process_tree(
     monkeypatch.setattr(exe_entry.sys, "frozen", True, raising=False)
     monkeypatch.setattr(exe_entry.sys, "argv", arguments)
 
-    expected = expected_on_windows if os.name == "nt" else False
-    assert exe_entry._should_hold_windows_app_mutex() is expected
+    monkeypatch.setattr(exe_entry, "os", SimpleNamespace(name="nt"))
+    assert exe_entry._should_hold_windows_app_mutex() is expected_on_windows
+
+
+@pytest.mark.parametrize("outcome", ["exited", "access_denied", "timeout"])
+def test_uninstall_email_mcp_cleanup(exe_entry, monkeypatch, tmp_path, outcome):
+    backend = tmp_path / "resources" / "backend"
+    node = backend / "runtime" / "node-runtime" / "node.exe"
+    package = tmp_path / "npm-cache" / "node_modules"
+    entry = package.joinpath(".bin", "..", "@codefuturist", "email-mcp", "dist", "main.js")
+
+    target = Mock(info={"name": "node.exe"})
+    target.exe.return_value = str(node)
+    target.cmdline.return_value = [str(node), str(entry), "stdio"]
+    unrelated = Mock(info={"name": "node.exe"})
+    unrelated.exe.return_value = str(node)
+    unrelated.cmdline.return_value = [str(node), str(tmp_path / "other.js")]
+    other_install = Mock(info={"name": "node.exe"})
+    other_install.exe.return_value = str(tmp_path / "other-install" / "node.exe")
+    other_install.cmdline.return_value = target.cmdline.return_value
+
+    if outcome == "access_denied":
+        target.cmdline.side_effect = psutil.AccessDenied()
+
+    wait_procs = Mock(return_value=([], [target] if outcome == "timeout" else []))
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs: [unrelated, target, other_install])
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    monkeypatch.setattr(exe_entry, "os", SimpleNamespace(name="nt", path=os.path))
+    monkeypatch.setattr(exe_entry.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(exe_entry.sys, "executable", str(backend / "workswarm.exe"))
+
+    assert exe_entry._stop_bundled_email_mcp() == (0 if outcome == "exited" else 1)
+    if outcome == "access_denied":
+        target.kill.assert_not_called()
+        wait_procs.assert_called_once_with([], timeout=3)
+    else:
+        target.kill.assert_called_once_with()
+        wait_procs.assert_called_once_with([target], timeout=3)
+    unrelated.kill.assert_not_called()
+    other_install.kill.assert_not_called()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows frozen cleanup entry")
+def test_cleanup_dispatch_runs_before_workspace_initialization(monkeypatch):
+    original_import = builtins.__import__
+    bootstrap_modules = {"jiuwenswarm.common._build_config", "jiuwenswarm.common.windows_upgrade_config"}
+
+    def reject_application_import(name, *args, **kwargs):
+        if name.startswith("jiuwenswarm") and name not in bootstrap_modules:
+            pytest.fail(f"Cleanup imported application initialization: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_application_import)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "argv", ["workswarm.exe", "--desktop-stop-bundled-email-mcp"])
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs: [])
+    monkeypatch.setattr(psutil, "wait_procs", lambda processes, timeout: ([], []))
+    with pytest.raises(SystemExit) as exited:
+        runpy.run_path(str(ENTRY_PATH), run_name="__main__")
+    assert exited.value.code == 0
 
 
 def test_main_acquires_mutex_before_dispatch(exe_entry, monkeypatch):

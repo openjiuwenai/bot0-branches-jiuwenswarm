@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from PIL import Image
 
 import jiuwenswarm.common.utils as utils
 from jiuwenswarm.server.runtime import extension_package_manager as catalog
@@ -42,6 +43,30 @@ _KINDS = (AGENT_TEMPLATES, PLUGIN_PACKAGES)
 def _run(coro):
     """Drive an async catalog call from a synchronous test."""
     return _asyncio.run(coro)
+
+
+def test_package_avatar_thumbnail_stays_inside_package(tmp_path: Path) -> None:
+    package_dir = tmp_path / "expert"
+    package_dir.mkdir()
+    image = tmp_path / "avatar.png"
+    Image.new("RGB", (512, 512), "blue").save(image)
+    shutil.copyfile(image, package_dir / "avatar.png")
+
+    thumbnail = catalog.resolve_package_avatar_thumbnail(package_dir, "avatar.png")
+    assert thumbnail.startswith("data:image/webp;base64,")
+    assert len(thumbnail) < 16 * 1024
+    for reference in ("../avatar.png", str(image), "missing.png", "https://example.test/avatar.png"):
+        assert catalog.resolve_package_avatar_thumbnail(package_dir, reference) == ""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Creating a symlink can require Windows developer mode")
+def test_package_avatar_thumbnail_rejects_symlink_to_other_directory(tmp_path: Path) -> None:
+    package_dir = tmp_path / "expert"
+    package_dir.mkdir()
+    image = tmp_path / "avatar.png"
+    Image.new("RGB", (32, 32), "blue").save(image)
+    (package_dir / "outside.png").symlink_to(image)
+    assert catalog.resolve_package_avatar_thumbnail(package_dir, "outside.png") == ""
 
 
 def test_normalize_agent_group_display_identity_preserves_binding_and_asset_id():
@@ -340,7 +365,7 @@ class TestPrepareWorkspaceAndMarketplace:
         workspace_root = tmp_path / ".jiuwenswarm"
         (workspace_root / "config").mkdir(parents=True)
         (workspace_root / "config" / "config.yaml").write_text("{}", encoding="utf-8")
-        monkeypatch.setattr(utils, "_workspace_base_dir", workspace_root)
+        monkeypatch.setattr("jiuwenswarm.common.paths._workspace_base_dir", workspace_root)
 
         def _fail() -> None:
             raise AssertionError("AgentServer startup must not initialize equipment workspace")
@@ -1222,7 +1247,7 @@ class TestCreateInstallUninstall:
             },
         )
 
-        with pytest.raises(ValueError, match="provider_name.*claudecode.*codex.*dsh"):
+        with pytest.raises(ValueError, match="provider_name.*claudecode.*codex;"):
             catalog.install_agent_template({"id": "invalid-runtime"})
 
         assert catalog.read_agent_template_marketplace_entries() == []
@@ -1238,7 +1263,7 @@ class TestCreateInstallUninstall:
             extra_manifest={
                 "name": "unsupported-runtime",
                 "description": "External expert with unsupported native capabilities.",
-                "runtime": {"provider_name": "dsh"},
+                "runtime": {"provider_name": "codex"},
                 unsupported_field: [{"file": "unsupported.py"}],
             },
         )
@@ -1619,6 +1644,29 @@ def _write_src_zip(root: Path, kind: str, package_id: str) -> Path:
     return zip_path
 
 
+@pytest.mark.parametrize("provider_name", ["gemini", "dsh"])
+def test_install_imported_expert_lists_only_supported_providers(
+    extension_workspace: Path, tmp_path: Path, provider_name: str
+) -> None:
+    package_id = "external-expert"
+    manifest = _src_manifest(AGENT_TEMPLATES, package_id)
+    manifest["runtime"] = {"provider_name": provider_name}
+    zip_path = tmp_path / f"{package_id}.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(f"{package_id}/manifest.json", json.dumps(manifest))
+        archive.writestr(f"{package_id}/README.md", "External expert.")
+        archive.writestr(f"{package_id}/persona/{package_id}.md", "# Persona")
+
+    imported = catalog.import_agent_template({"path": str(zip_path)})
+    with pytest.raises(ValueError) as error:
+        catalog.install_agent_template(imported)
+
+    assert str(error.value) == (
+        f"runtime.provider_name must be one of: claudecode, codex; got {provider_name!r}"
+    )
+    assert marketplace_entries(AGENT_TEMPLATES)[0]["installed"] is False
+
+
 class TestImportLocal:
     """import_local: path → local/{id}/ + marketplace installed=false."""
 
@@ -1658,8 +1706,11 @@ class TestImportLocal:
         marker = pkg / "_keep.txt"
         marker.write_text("keep", encoding="utf-8")
         src = _write_src_dir(tmp_path, kind, "mine")
-        with pytest.raises(ValueError, match="already exists"):
+        with pytest.raises(ValueError, match="already exists") as excinfo:
             _import_package(kind, {"path": str(src)})
+        if kind == AGENT_TEMPLATES:
+            # 同 id 必须命中 id 判重，而不是被显示名判重抢先报「与自己冲突」。
+            assert "display name conflict" not in str(excinfo.value)
         assert marker.read_text(encoding="utf-8") == "keep"
         manifest = json.loads((pkg / "manifest.json").read_text(encoding="utf-8"))
         if kind == AGENT_TEMPLATES:
@@ -1752,6 +1803,225 @@ class TestImportLocal:
         assert not (
             extension_workspace / "plugins" / PLUGIN_PACKAGES / "local" / "office-kit"
         ).exists()
+
+
+class TestAgentTemplateNameUniqueness:
+    """Display-name uniqueness on agent_template create/import (mirrors groups)."""
+
+    def test_create_rejects_duplicate_display_name(
+        self, extension_workspace: Path
+    ) -> None:
+        create_package(AGENT_TEMPLATES, "demo-expert")
+
+        with pytest.raises(ValueError, match="already exists in local: DEMO-EXPERT"):
+            catalog.create_agent_template(
+                {
+                    "id": "demo-expert-2",
+                    "name": "DEMO-EXPERT",
+                    "description": "D",
+                    "persona": "P",
+                    "skills": [],
+                }
+            )
+
+        local_root = extension_workspace / "plugins" / AGENT_TEMPLATES / "local"
+        assert not (local_root / "demo-expert-2").exists()
+        assert len(marketplace_entries(AGENT_TEMPLATES)) == 1
+
+    def test_import_rejects_exported_copy_of_created_package(
+        self, extension_workspace: Path, tmp_path: Path
+    ) -> None:
+        # Created packages live under a uuid-suffixed directory id while the
+        # exported copy imports under its clean manifest name, so only the
+        # display-name check can catch the duplicate.
+        seed_package(
+            extension_workspace,
+            AGENT_TEMPLATES,
+            "demo-expert-9f1c2ab4",
+            extra_manifest={
+                "name": "demo-expert",
+                "display_name": {"zh": "demo-expert", "en": "demo-expert"},
+                "persona": {"dir": "./persona"},
+            },
+        )
+        src = _write_src_dir(tmp_path, AGENT_TEMPLATES, "demo-expert")
+
+        with pytest.raises(ValueError, match="already exists in local: demo-expert"):
+            catalog.import_agent_template({"path": str(src)})
+
+        local_root = extension_workspace / "plugins" / AGENT_TEMPLATES / "local"
+        assert not (local_root / "demo-expert").exists()
+        assert (local_root / "demo-expert-9f1c2ab4" / "manifest.json").is_file()
+        assert marketplace_entries(AGENT_TEMPLATES) == []
+
+    def test_import_rejects_duplicate_display_name_other_language(
+        self, extension_workspace: Path, tmp_path: Path
+    ) -> None:
+        seed_package(
+            extension_workspace,
+            AGENT_TEMPLATES,
+            "first-expert",
+            extra_manifest={
+                "name": "first-expert",
+                "display_name": {"zh": "示例专家", "en": "Demo Expert"},
+            },
+        )
+        src = _write_src_dir(tmp_path, AGENT_TEMPLATES, "second-expert")
+        manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
+        manifest["display_name"] = {"zh": "另一个名字", "en": "demo expert"}
+        (src / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+        )
+
+        with pytest.raises(ValueError, match="already exists in local: demo expert"):
+            catalog.import_agent_template({"path": str(src)})
+
+        assert not (
+            extension_workspace
+            / "plugins"
+            / AGENT_TEMPLATES
+            / "local"
+            / "second-expert"
+        ).exists()
+
+    def test_import_rejects_display_name_claimed_by_built_in(
+        self, extension_workspace: Path, tmp_path: Path
+    ) -> None:
+        seed_package(
+            extension_workspace,
+            AGENT_TEMPLATES,
+            "builtin-expert",
+            under="built_in",
+            extra_manifest={
+                "name": "builtin-expert",
+                "display_name": {"zh": "builtin-expert", "en": "builtin-expert"},
+            },
+        )
+        src = _write_src_dir(tmp_path, AGENT_TEMPLATES, "copy-expert")
+        manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
+        manifest["display_name"] = {"zh": "builtin-expert", "en": "builtin-expert"}
+        (src / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="already exists in built_in"):
+            catalog.import_agent_template({"path": str(src)})
+
+        assert not (
+            extension_workspace / "plugins" / AGENT_TEMPLATES / "local" / "copy-expert"
+        ).exists()
+
+    def test_import_allows_distinct_display_name(
+        self, extension_workspace: Path, tmp_path: Path
+    ) -> None:
+        seed_package(
+            extension_workspace,
+            AGENT_TEMPLATES,
+            "first-expert",
+            extra_manifest={
+                "name": "first-expert",
+                "display_name": {"zh": "示例专家", "en": "Demo Expert"},
+            },
+        )
+        src = _write_src_dir(tmp_path, AGENT_TEMPLATES, "second-expert")
+
+        result = catalog.import_agent_template({"path": str(src)})
+
+        assert result == {"id": "second-expert"}
+        dest = (
+            extension_workspace / "plugins" / AGENT_TEMPLATES / "local" / "second-expert"
+        )
+        assert dest.is_dir()
+
+    def test_update_rejects_display_name_of_other_package(
+        self, extension_workspace: Path
+    ) -> None:
+        create_package(AGENT_TEMPLATES, "demo-expert")
+        create_package(AGENT_TEMPLATES, "other-expert")
+
+        with pytest.raises(ValueError, match="already exists in local: DEMO-EXPERT"):
+            catalog.update_agent_template(
+                {
+                    "id": "other-expert",
+                    "name": "DEMO-EXPERT",
+                    "description": "D",
+                    "persona": "P",
+                    "skills": [],
+                }
+            )
+
+        manifest = json.loads(
+            (
+                extension_workspace
+                / "plugins"
+                / AGENT_TEMPLATES
+                / "local"
+                / "other-expert"
+                / "manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert manifest["name"] == "other-expert"
+
+    def test_update_allows_keeping_or_recasing_own_name(
+        self, extension_workspace: Path
+    ) -> None:
+        create_package(AGENT_TEMPLATES, "demo-expert")
+
+        catalog.update_agent_template(
+            {
+                "id": "demo-expert",
+                "name": "Demo-Expert",
+                "description": "D2",
+                "persona": "P2",
+                "skills": [],
+            }
+        )
+
+        manifest = json.loads(
+            (
+                extension_workspace
+                / "plugins"
+                / AGENT_TEMPLATES
+                / "local"
+                / "demo-expert"
+                / "manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert manifest["name"] == "Demo-Expert"
+        assert manifest["description"] == "D2"
+
+    def test_update_allows_unchanged_name_despite_legacy_duplicate(
+        self, extension_workspace: Path
+    ) -> None:
+        """存量同名数据不追溯：未改名的普通编辑（仅改描述）仍可保存。"""
+        create_package(AGENT_TEMPLATES, "demo-expert")
+        create_package(AGENT_TEMPLATES, "other-expert")
+        # 人为构造判重上线前的存量同名：other-expert 的显示名与 demo-expert 相同。
+        other_manifest_path = (
+            extension_workspace
+            / "plugins"
+            / AGENT_TEMPLATES
+            / "local"
+            / "other-expert"
+            / "manifest.json"
+        )
+        other_manifest = json.loads(other_manifest_path.read_text(encoding="utf-8"))
+        other_manifest["display_name"] = {"zh": "demo-expert", "en": "demo-expert"}
+        other_manifest["name"] = "demo-expert"
+        other_manifest_path.write_text(
+            json.dumps(other_manifest, ensure_ascii=False), encoding="utf-8"
+        )
+
+        catalog.update_agent_template(
+            {
+                "id": "other-expert",
+                "name": "demo-expert",
+                "description": "D3",
+                "persona": "P3",
+                "skills": [],
+            }
+        )
+
+        updated = json.loads(other_manifest_path.read_text(encoding="utf-8"))
+        assert updated["description"] == "D3"
 
 
 class TestInstallPendingConnectorsGate:
@@ -1991,13 +2261,8 @@ class TestListShowAndFileRead:
         assert "teamCompatible" not in default_card
         assert calls == []
 
-        group_card = next(
-            card
-            for card in _run(catalog.list_agent_templates(
-                {"include_team_compatibility": True}
-            ))
-            if card["id"] == "mine"
-        )
+        group_cards = _run(catalog.list_agent_templates({"include_team_compatibility": True}))
+        group_card = next(card for card in group_cards if card["id"] == "mine")
         assert group_card["teamCompatible"] == {"leader": True, "member": True}
         assert len(calls) == 1
 

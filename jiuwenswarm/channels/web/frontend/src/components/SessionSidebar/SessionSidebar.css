@@ -23,9 +23,9 @@
    ============================================ */
 
 .sidebar--icon-rail {
-  width: 72px;
-  max-width: 72px;
-  min-width: 72px;
+  width: var(--mode-rail-width);
+  max-width: var(--mode-rail-width);
+  min-width: var(--mode-rail-width);
   flex-shrink: 0;
   align-items: center;
   padding: 0;
@@ -34,9 +34,9 @@
 }
 
 .shell--agent-management .sidebar--icon-rail {
-  width: 72px;
-  max-width: 72px;
-  min-width: 72px;
+  width: var(--mode-rail-width);
+  max-width: var(--mode-rail-width);
+  min-width: var(--mode-rail-width);
 }
 
 /* Logo in icon rail — SVG handles gradient + mark */
@@ -52,6 +52,8 @@
 
 .icon-rail-logo img {
   display: block;
+  /* A package logo keeps its proportions inside the host's square. */
+  object-fit: contain;
 }
 
 /* Nav items in icon rail */
@@ -140,7 +142,7 @@
 .enterprise-context-popover {
   position: absolute;
   z-index: 1500;
-  left: 72px;
+  left: 100%;
   bottom: 12px;
   width: 280px;
   padding: 12px;
@@ -151,61 +153,8 @@
 }
 .enterprise-context-popover__user { margin: 0 2px 8px; padding: 4px 4px 10px; border-bottom: 1px solid var(--color-border-default); color: var(--color-text-primary); font-size: 13px; font-weight: 600; }
 .enterprise-context-popover__user small { display: block; margin-top: 4px; color: var(--color-text-secondary); font-size: 11px; font-weight: 400; }
-.enterprise-context-popover label { display: block; margin-top: 8px; color: var(--color-text-secondary); font-size: 11px; }
-.enterprise-context-popover__modes {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 4px;
-  margin: 0 0 4px;
-  padding: 3px;
-  border: 1px solid var(--color-border-default);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--color-surface-card) 70%, transparent);
-}
-.enterprise-context-popover__mode {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  height: 28px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  font-size: 11px;
-}
-.enterprise-context-popover__mode--active {
-  background: var(--color-surface-card);
-  color: var(--color-text-primary);
-  font-weight: 600;
-  box-shadow: var(--effect-shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.06));
-}
-.enterprise-context-popover__mode-check { color: #16a34a; font-size: 12px; font-weight: 700; line-height: 1; }
-.enterprise-context-popover__mode:disabled,
-.enterprise-context-popover__input:disabled,
-.enterprise-context-popover__apply:disabled { cursor: wait; opacity: 0.65; }
 .enterprise-context-popover .editable-combobox { margin-top: 4px; }
-.enterprise-context-popover__input {
-  display: block;
-  box-sizing: border-box;
-  width: 100%;
-  height: 32px;
-  margin-top: 4px;
-  padding: 0 9px;
-  border: 1px solid var(--color-border-default);
-  border-radius: 7px;
-  outline: none;
-  background: var(--color-surface-card);
-  color: var(--color-text-primary);
-  font-size: 12px;
-}
-.enterprise-context-popover__input:focus {
-  border-color: var(--color-action-primary);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-action-primary) 16%, transparent);
-}
-.enterprise-context-popover__apply,
+.enterprise-context-popover__current-agent { margin-top: 8px; color: var(--color-text-secondary); font-size: 11px; line-height: 1.45; }
 .enterprise-context-popover__logout {
   width: 100%;
   margin-top: 10px;
@@ -217,13 +166,10 @@
   font-size: 12px;
   text-align: center;
 }
-.enterprise-context-popover__apply { background: var(--color-surface-card); color: var(--color-text-primary); }
-.enterprise-context-popover__apply:hover:not(:disabled) { border-color: var(--color-action-primary); color: var(--color-action-primary); }
 .enterprise-context-popover__logout { margin-top: 8px; color: var(--color-feedback-danger); }
 .enterprise-context-popover__logout:hover { background: color-mix(in srgb, var(--color-feedback-danger) 8%, transparent); border-color: var(--color-feedback-danger); }
 .enterprise-context-popover__status { margin-top: 10px; color: var(--color-text-secondary); font-size: 11px; }
 .enterprise-context-popover__error { margin-top: 10px; color: var(--color-feedback-danger); font-size: 11px; line-height: 1.45; }
-.enterprise-context-popover label { display: block; margin-top: 10px; color: var(--color-text-secondary); font-size: 11px; }
 .editable-combobox {
   position: relative;
   margin-top: 5px;
@@ -319,4 +265,62 @@
 .editable-combobox__option--active,
 .editable-combobox__option:hover {
   background: var(--color-surface-hover);
+}
+
+/* ============================================
+   WebUI user entry (application.sidebar.footer)
+   ============================================ */
+
+/* Slot container: keep the entry centered and clear of the window edge.
+   The host renders a column flex box; horizontal centering needs align-items. */
+.icon-rail-user-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding-bottom: 12px;
+}
+
+/* The per-instance wrapper stretches by default; center the adapter inside it. */
+.icon-rail-user-slot > .webui-host-instance {
+  display: flex;
+  justify-content: center;
+}
+
+/* Dropdown trigger: same footprint as the rail nav items. */
+.icon-rail-user-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 8px;
+  color: var(--color-text-primary);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.icon-rail-user-trigger:hover,
+.icon-rail-user-trigger[aria-expanded='true'] {
+  background: var(--color-sidebar-nav-active);
+}
+
+.icon-rail-user-trigger:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+/* Avatar ring keeps the image readable on the sidebar surface. */
+.icon-rail-user-avatar {
+  box-shadow: 0 0 0 1px var(--color-border-default);
+}
+
+/* Signed-out placeholder keeps the rail rhythm. */
+.icon-rail-user-signin {
+  width: 48px;
+  height: 32px;
+  padding: 0;
+  border-radius: 8px;
+  font-size: 12px;
 }

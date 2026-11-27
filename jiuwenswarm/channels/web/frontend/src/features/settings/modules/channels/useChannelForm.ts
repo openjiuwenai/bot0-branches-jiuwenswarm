@@ -1,8 +1,13 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useForm, useFormState } from '../../../../components/form';
 import type { FormStore } from '../../../../components/form/core/FormStore';
 import type { FormValues } from '../../../../components/form/types';
 import { useSettingsServices } from '../../services/SettingsServicesProvider';
+
+// Module-scope counter issuing globally increasing failure sequence numbers: the page-level
+// toast picks the latest failure across channels, so occurrences need a total order even
+// though each form keeps its own state.
+let failureSequence = 0;
 
 type ChannelFormOptions<TValues extends FormValues> = {
   initialValues: () => TValues;
@@ -13,6 +18,7 @@ type ChannelFormOptions<TValues extends FormValues> = {
   setMethod: string;
   loadErrorMessage: string;
   saveErrorMessage: string;
+  saveErrorByCode?: Readonly<Record<string, string>>;
   savedMessage: string;
   onSaved: () => void;
 };
@@ -25,6 +31,7 @@ export type ChannelFormController<TValues extends FormValues> = {
   configured: boolean;
   error: string | null;
   success: string | null;
+  failureSeq: number;
   hasUnsavedChanges: boolean;
   load: () => Promise<boolean>;
   save: () => Promise<boolean>;
@@ -41,6 +48,7 @@ export function useChannelForm<TValues extends FormValues>({
   setMethod,
   loadErrorMessage,
   saveErrorMessage,
+  saveErrorByCode,
   savedMessage,
   onSaved,
 }: ChannelFormOptions<TValues>): ChannelFormController<TValues> {
@@ -53,22 +61,33 @@ export function useChannelForm<TValues extends FormValues>({
   const [configured, setConfigured] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  // Sequence of the latest failure recorded by this form, taken from the module-scope counter
+  // above. The toast layer uses it to fire once per failure occurrence and to show the latest
+  // failure alone instead of a join that accumulates older persistent errors.
+  const [failureSeq, setFailureSeq] = useState(0);
+  // Only the latest load may land: a stale load must not clobber the form, the loaded flag,
+  // or the error surface owned by a newer load or a concurrent user action (save/toggle).
+  const loadSeqRef = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     setError(null);
     setSuccess(null);
     try {
       const payload = await request<{ config?: unknown }>(getMethod);
+      if (seq !== loadSeqRef.current) return false;
       form.reset(readValues(payload?.config));
       setConfigured(isConfigured(payload?.config));
       setLoaded(true);
       return true;
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : loadErrorMessage);
+      if (seq !== loadSeqRef.current) return false;
+      setError(loadError instanceof Error && loadError.message ? loadError.message : loadErrorMessage);
+      setFailureSeq(++failureSequence);
       return false;
     } finally {
-      setLoading(false);
+      if (seq === loadSeqRef.current) setLoading(false);
     }
   }, [form, getMethod, isConfigured, loadErrorMessage, readValues, request]);
 
@@ -86,13 +105,16 @@ export function useChannelForm<TValues extends FormValues>({
         onSaved();
         return true;
       } catch (saveError) {
-        setError(saveError instanceof Error ? saveError.message : saveErrorMessage);
+        const code = saveError && typeof saveError === 'object' && 'code' in saveError ? saveError.code : undefined;
+        const localizedError = typeof code === 'string' ? saveErrorByCode?.[code] : undefined;
+        setError(localizedError ?? (saveError instanceof Error && saveError.message ? saveError.message : saveErrorMessage));
+        setFailureSeq(++failureSequence);
         return false;
       } finally {
         setSaving(false);
       }
     },
-    [form, isConfigured, onSaved, readValues, request, saveErrorMessage, saving, setMethod],
+    [form, isConfigured, onSaved, readValues, request, saveErrorByCode, saveErrorMessage, saving, setMethod],
   );
 
   const save = useCallback(async () => {
@@ -113,12 +135,6 @@ export function useChannelForm<TValues extends FormValues>({
     setSuccess(null);
   }, [formState.hasUnsavedChanges]);
 
-  useEffect(() => {
-    if (!error) return;
-    const timer = window.setTimeout(() => setError(null), 2000);
-    return () => window.clearTimeout(timer);
-  }, [error]);
-
   return {
     form,
     loading,
@@ -127,6 +143,7 @@ export function useChannelForm<TValues extends FormValues>({
     configured,
     error,
     success,
+    failureSeq,
     hasUnsavedChanges: formState.hasUnsavedChanges,
     load,
     save,

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+from types import SimpleNamespace
 
 from openjiuwen.agent_teams.harness.manifest import ElementKind, harness_element
 from openjiuwen.agent_teams.group_chat.tools import GroupSendMessageTool
@@ -41,9 +42,26 @@ _PROXY_DELIVERABLE_ERROR = (
 )
 # send_file_to_user emits a direct-chat file event that the group chat never shows.
 _GROUP_SEND_FILE_ERROR = (
-    "send_file_to_user does not reach the group chat. Post the final file with group_send_message, "
-    "passing your task's execution_id and the file in attachments as {name, path}. "
-    "If you have no execution_id, call start_group_task first."
+    "send_file_to_user does not reach the group chat, so the file was NOT delivered. "
+    "Post the file with group_send_message, passing your task's execution_id and the file in "
+    "attachments as {name, path}. If you have no execution_id, call start_group_task first. "
+    "Do not tell the user a file was sent until that call succeeds."
+)
+# The card must appear when work starts, not when its result is posted.
+_START_TASK_FIRST_TOOLS = frozenset({"write_file", "edit_file"})
+_START_TASK_FIRST_ERROR = (
+    "Producing a file is substantive work and no task is running. Call start_group_task first with a "
+    "short description of the work, then write the file and deliver it with group_send_message, "
+    "passing the returned execution_id and the file in attachments."
+)
+_ATTACHMENT_NEEDS_TASK_ERROR = (
+    "Attachments are delivered as a task result. Call start_group_task first, then repeat this "
+    "group_send_message with the returned execution_id."
+)
+# The model often pairs a rejected file delivery with a chat message claiming the file was sent.
+_UNDELIVERED_FILE_REPLY_ERROR = (
+    "Your file was not delivered, so this message was not posted. Send one group_send_message "
+    "that carries the file in attachments as {name, path} together with this text."
 )
 
 
@@ -95,6 +113,9 @@ TASK_RULES = (
     "For an assigned direct answer, use group_send_message with its execution_id without starting a task. "
     "Do not publish progress, reasoning or intermediate results to the group. "
     "Use group_send_message with execution_id, content and attachments for the final task result. "
+    "Producing a file is substantive work: call start_group_task before writing it, then deliver it in "
+    "group_send_message attachments with that execution_id. "
+    "Never say a file was sent before that call succeeds. "
     "An expert-team proxy delegates substantive team work through run_team. "
     "Call run_team to consult the private team context. It does not create a card until actual work starts. "
     "run_team returns immediately after accepting background work. Do not submit its result yourself. "
@@ -106,6 +127,8 @@ TASK_RULES = (
     "or call run_team when the expert team should do it. "
     "That run_team resumes the same instance and loads the context from its earlier child task. "
     "When the same message mentions only multiple expert teams, the first mentioned team is the Owner. "
+    "An unmentioned message may also be assigned to several expert teams with a named Owner; "
+    "it follows the same rules. "
     "The Owner chooses group_send_message for ordinary chat, run_team for substantive work, "
     "or ask_user for missing requirements. Mere greetings or acknowledgements need no organization. "
     "Other proxies wait for the Owner's task decision and then call run_team for that message. "
@@ -182,7 +205,8 @@ class GroupMessageTool(GroupSendMessageTool):
         self.card.description += (
             " For a final task result, supply execution_id and optional attachments; "
             "this publishes the result and completes that execution. "
-            "Without execution_id this is ordinary chat, requiring client_message_id."
+            "Without execution_id this is ordinary chat, requiring client_message_id; "
+            "attachments require an execution_id from start_group_task."
             " Only for a pure multi-expert-team request, explicitly set organization_reply: "
             "acknowledgement for an interim receipt (not posted; continue with ask_user or run_team), "
             "or final_chat only for a complete conversational answer with no remaining question or work. "
@@ -233,6 +257,8 @@ class GroupMessageTool(GroupSendMessageTool):
         if blocked:
             return ToolOutput(success=False, error=blocked)
         if "execution_id" not in inputs:
+            if inputs.get("attachments"):
+                return ToolOutput(success=False, error=_ATTACHMENT_NEEDS_TASK_ERROR)
             return await super().invoke(inputs, **kwargs)
         store = GroupExecutions(self.context.session_id)
         try:
@@ -260,6 +286,8 @@ class GroupTaskPolicyRail(DeepAgentRail):
         self.context = context
         # Set once run_team hands this turn's request to the private team; the group reply then comes from it.
         self._delegated = False
+        # Set when this model step tried a file delivery that cannot reach the group.
+        self._file_undelivered = False
 
     async def on_user_message(self, ctx):
         from jiuwenswarm.agents.swarm.group_turn import bind_consumed_group_turn
@@ -296,6 +324,7 @@ class GroupTaskPolicyRail(DeepAgentRail):
         from openjiuwen.harness.prompts import PromptSection
         from jiuwenswarm.agents.swarm.group_turn import TURN_KEY
 
+        self._file_undelivered = False
         turn = getattr(ctx, "extra", {}).get(TURN_KEY)
         if turn is not None and turn.route == "unknown":
             ctx.request_force_finish({"output": turn.error or "Cannot verify the triggering group message.",
@@ -319,9 +348,10 @@ class GroupTaskPolicyRail(DeepAgentRail):
                 return
             content = (
                 "Decide only this original multi-team message: "
-                + json.dumps({"client_message_id": turn.client_message_id})
+                + json.dumps({"client_message_id": turn.client_message_id, "teams": item["members"]},
+                             ensure_ascii=False)
                 + ". You are its Owner. No organization task exists yet. For greetings, acknowledgements, "
-                "or ordinary conversation, reply on behalf of the mentioned teams using group_send_message. "
+                "or ordinary conversation, reply on behalf of these teams using group_send_message. "
                 "For substantive work, call run_team to create this message's organization. "
                 "If requirements need clarification, use ask_user first. Do not treat @mentions alone as a task. "
                 "Do not send an acknowledgement before asking or starting work. If you use group_send_message, "
@@ -358,11 +388,47 @@ class GroupTaskPolicyRail(DeepAgentRail):
             and not getattr(response, "tool_calls", None)
         ):
             restore_suspended_organization(ctx)
+            await self._deliver_pending_owner_answer(ctx)
+
+    async def _deliver_pending_owner_answer(self, ctx):
+        """Post an Owner's plain answer for a still-open multi-team request.
+
+        A first text reply is ordinary chat. It stays on this route only:
+        a run_team, ask_user, or group_send_message decision already made in
+        the turn is left untouched, and every other mention shape is too.
+        """
+        if getattr(self, "_organization_decision", False):
+            return
+        from jiuwenswarm.agents.swarm.group_route import candidate, ordinary_reply
+        from jiuwenswarm.agents.swarm.group_turn import TURN_KEY
+
+        turn = getattr(ctx, "extra", {}).get(TURN_KEY)
+        if turn is None or turn.route != "organization" or not turn.client_message_id:
+            return
+        if turn.member_name != self.context.member_name:
+            return
+        content = getattr(getattr(ctx, "inputs", None), "response", None)
+        content = getattr(content, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            return
+        item = candidate(self.context.session_id, turn.client_message_id)
+        if item is None or item["status"] != "pending" or item["owner_member"] != self.context.member_name:
+            return
+        backend = get_team_backend(self.context)
+        if backend is None or getattr(backend, "conversation_mode", None) != "group_chat":
+            return
+        await ordinary_reply(
+            SimpleNamespace(backend=backend, context=self.context),
+            {"content": content, "organization_reply": "final_chat"},
+            turn.client_message_id,
+            GroupSendMessageTool(backend, lambda _: "").invoke,
+        )
 
     async def before_invoke(self, ctx):
         from openjiuwen.harness.prompts import PromptSection
 
         self._delegated = False
+        self._organization_decision = False
         group = read_group(self.context.session_id)
         if group is None:
             return
@@ -514,8 +580,23 @@ class GroupTaskPolicyRail(DeepAgentRail):
             if member["kind"] == "agent_group" and ctx.inputs.tool_name in _PROXY_DELIVERABLE_TOOLS:
                 _reject_tool(ctx, _PROXY_DELIVERABLE_ERROR)
                 return
+            if (
+                member["kind"] == "agent_template"
+                and ctx.inputs.tool_name in _START_TASK_FIRST_TOOLS
+                and GroupExecutions(self.context.session_id).active(self.context.member_name) is None
+            ):
+                _reject_tool(ctx, _START_TASK_FIRST_ERROR)
+                return
             if ctx.inputs.tool_name == "send_file_to_user":
+                self._file_undelivered = True
                 _reject_tool(ctx, _GROUP_SEND_FILE_ERROR)
+                return
+            if (
+                self._file_undelivered
+                and ctx.inputs.tool_name == "group_send_message"
+                and not _tool_arguments(ctx).get("attachments")
+            ):
+                _reject_tool(ctx, _UNDELIVERED_FILE_REPLY_ERROR)
                 return
         if ctx.inputs.tool_name == "send_message":
             group = read_group(self.context.session_id)
@@ -583,13 +664,15 @@ class GroupTaskPolicyRail(DeepAgentRail):
 
     async def after_tool_call(self, ctx):
         self._reset_group_turn(ctx)
-        if ctx.inputs.tool_name in {"run_team", "group_send_message"}:
+        if ctx.inputs.tool_name in {"run_team", "group_send_message", "ask_user"}:
             from jiuwenswarm.agents.swarm.group_turn import restore_suspended_organization
 
             result = getattr(ctx.inputs, "tool_result", None)
             success = result.get("success") if isinstance(result, dict) else getattr(result, "success", False)
             if success is True:
-                restore_suspended_organization(ctx)
+                self._organization_decision = True
+                if ctx.inputs.tool_name in {"run_team", "group_send_message"}:
+                    restore_suspended_organization(ctx)
         if ctx.inputs.tool_name == "run_team":
             output = ctx.inputs.tool_result
             if isinstance(output, ToolOutput):

@@ -17,6 +17,8 @@ export type SkillItem = {
   name: string;
   /** 展示名（保留安装来源的原始大小写，如 ClawHub 的 Weather）；缺省回退到 name */
   display_name?: string;
+  /** 企业技能源安装时落账本的广场卡片名；列表展示以 display_name 为准 */
+  market_display_name?: string;
   description: string;
   source: string;
   version: string;
@@ -163,11 +165,17 @@ export type SkillFilePreview = {
 
 export type SkillRebuildResponse = {
   success: boolean;
-  result_type: 'followup';
-  action: string;
-  followup_prompt: string;
-  skill_name: string;
-  rebuild_target: {
+  pending?: boolean;
+  rebuild_id?: string;
+  status?: 'running' | 'done' | 'failed';
+  detail?: string;
+  code?: string;
+  name?: string;
+  result_type?: 'followup';
+  action?: string;
+  followup_prompt?: string;
+  skill_name?: string;
+  rebuild_target?: {
     version: string | null;
     is_default: boolean;
     skill_dir: string;

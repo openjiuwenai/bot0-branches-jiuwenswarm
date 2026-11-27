@@ -48,11 +48,11 @@ import { MessageList } from './MessageList';
 import { ContextCompressionLines } from './MessageItem';
 import { activeMoaPhase, MoaProgress } from './MoaProgress';
 import { InputArea, type InputAreaHandle } from './InputArea';
+import { WebUIHost, type WebUIStyleOverrides } from '../../features/webui';
+import { WelcomeHeading, WelcomeMascot } from './WelcomeBrand';
 import ChatOverviewIcon from '../../assets/chat-overview.svg?react';
 import PanelCollapseIcon from '../../assets/panel-collapse.svg?react';
 import lineUpIcon from '../../assets/lineUp.svg';
-import beeFlyingIcon from '../../assets/bee-flying.webp';
-import beeStaticIcon from '../../assets/bee-static.png';
 import homeBanner from '../../assets/home-banner.svg';
 import { NEW_CONVERSATION_ID } from '../../multi-session/state/newConversationLifecycle';
 import loadSendIcon from '../../assets/load-send.svg';
@@ -67,10 +67,13 @@ import { GoalBar } from '../GoalBar';
 import { HarnessProgressBar } from './HarnessProgressBar';
 import { AgentTeamActivityCard } from './TeamEventGroupDisplay';
 import { isTeamActivityMessage, parseTeamEventMessage } from './teamEventUtils';
+import { stripUploadDocumentBlocks, toQueueContentPreview } from '../../utils/documentMessage';
 import { isTeamLeaderMember, type TeamMemberIdentity } from '../../utils/teamMemberAvatar';
 import { writeClipboard } from '../../utils/writeClipboard';
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
 import './ChatPanel.css';
+import { WorkspaceQuotaBanner } from '../WorkspacePanel/WorkspaceQuotaBanner';
+import { useWorkspaceQuotaEnabled } from '../../features/workspace/useWorkspaceQuotaEnabled';
 import { CodeChangesCard } from '../../features/code-mode/CodeChangesCard';
 import { useCodeTurnDiffHistory } from '../../features/code-mode/useCodeTurnDiffHistory';
 import { turnDiffKey } from '../../features/code-mode/turnChangeState';
@@ -111,6 +114,11 @@ import {
   type TopicStarterTopic,
   type TopicStarterVisibleSlate,
 } from '../../features/topicStarterVisibility';
+
+const pluginHeaderActionStyles: WebUIStyleOverrides = {
+  Button: { className: 'chat-panel-header__plugin-action shrink-0' },
+  Box: { unstyled: true, className: 'flex min-w-0 items-center gap-2' },
+};
 
 export interface ChatHistoryPagerProps {
   loadedBatchSeq: number;
@@ -181,6 +189,10 @@ interface ChatPanelProps {
   historyPager?: ChatHistoryPagerProps | null;
   /** 历史会话首屏恢复中：保持聊天布局，避免短暂退回欢迎态 */
   isHistoryRestoring?: boolean;
+  /** Show an already-created empty conversation with the regular bottom composer. */
+  conversationCreated?: boolean;
+  npcSession?: boolean;
+  headerActions?: React.ReactNode;
   /** 右侧面板展开状态：展开时隐藏对话框上方的活跃成员，null 表示面板隐藏 */
   teamAreaExpanded?: boolean | null;
   autoFocusKey?: string | null;
@@ -282,7 +294,7 @@ function SuggestionCard({
           listedAtLabel ? t('chat.topicStarter.hotListListedAt', { time: listedAtLabel }) : '',
         ].filter(Boolean).join(' · ')
       : [
-          source?.source_kind === 'news_report' ? '资讯' : '近期',
+          source?.source_kind === 'news_report' ? t('chat.topicStarter.newsReport') : t('chat.topicStarter.recent'),
           sourceSite,
           typeof source?.published_at === 'string' ? source.published_at.slice(5, 10).replace('-', '/') : '',
         ].filter(Boolean).join(' · ');
@@ -323,7 +335,7 @@ function SuggestionCard({
               </div>
             </details>
           ) : (
-            <a data-testid="chat-panel-topic-source" data-variant={topic.title} className="chat-suggestion-card__source" href={sourceUrl} target="_blank" rel="noreferrer" aria-label={`打开原文：${sourceBadge}`}>
+            <a data-testid="chat-panel-topic-source" data-variant={topic.title} className="chat-suggestion-card__source" href={sourceUrl} target="_blank" rel="noreferrer" aria-label={t('chat.topicStarter.openOriginal', { source: sourceBadge })}>
               {sourceBadge} <span aria-hidden="true">↗</span>
             </a>
           )}
@@ -503,9 +515,12 @@ export function AgentActivityCard({
       if (mediaItemCount > 0 && !window.confirm(t('chat.editTaskDropAttachments', { count: mediaItemCount }))) {
         return;
       }
-      setInputValue(sid, content);
+      // Queue rows store agent-facing 【上传文档】 blocks; restore only the query
+      // text (do not invent a filename placeholder into the composer).
+      const editText = stripUploadDocumentBlocks(content);
+      setInputValue(sid, editText);
       removeFromTaskQueue(sid, taskId);
-      window.dispatchEvent(new CustomEvent('chat-input-sync', { detail: { sessionId: sid, value: content } }));
+      window.dispatchEvent(new CustomEvent('chat-input-sync', { detail: { sessionId: sid, value: editText } }));
     }
   };
 
@@ -648,7 +663,9 @@ export function AgentActivityCard({
                     <img src={lineUpIcon} alt="" className="w-4 h-4" />
                   </div>
                   <span className="team-event-group-row__member" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {message.content}
+                    {toQueueContentPreview(message.content, {
+                      fallbackLabel: t('chatUi.queuedUploadDocument'),
+                    })}
                   </span>
                 </div>
                 <span
@@ -720,7 +737,10 @@ export function AgentActivityCard({
                     className="team-event-group-row__member"
                     style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
                   >
-                    {task.content}
+                    {toQueueContentPreview(task.content, {
+                      mediaItems: task.mediaItems,
+                      fallbackLabel: t('chatUi.queuedUploadDocument'),
+                    })}
                   </span>
                   {(task.mediaItems?.length ?? 0) > 0 && (
                     <span
@@ -808,22 +828,6 @@ function getTeamMessageIdentity(message: Message): string {
     event.timestamp || '',
     event.content,
   ].join(':');
-}
-
-function WelcomeHeading() {
-  const { i18n } = useTranslation();
-  const workMode = useWorkspaceStore((state) => state.workMode);
-  const isZh = i18n.language.startsWith('zh');
-  const suffix = workMode === 'design'
-    ? (isZh ? '轻松解决每个设计问题！' : 'solves every design problem!')
-    : (isZh ? '轻松解决工作每个问题！' : 'makes work easier!');
-
-  return (
-    <>
-      <span className="chat-welcome__heading-highlight">WorkSwarm</span>
-      <span>{suffix}</span>
-    </>
-  );
 }
 
 function GroupCreateWelcomeHeading() {
@@ -1123,52 +1127,7 @@ function scrollToBottom(el: HTMLDivElement): void {
   el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
 }
 
-const BEE_ANIMATION_DURATION = 4536;
 const WELCOME_BUBBLE_HIDE_DELAY = 3000;
-
-function BeeBanner({
-  className,
-  altText,
-  onTrigger,
-  onLeave,
-}: {
-  className: string;
-  altText: string;
-  onTrigger: () => void;
-  onLeave: () => void;
-}) {
-  const [isPlaying, setIsPlaying] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const handleMouseEnter = useCallback(() => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-    }
-    setIsPlaying(true);
-    onTrigger();
-    timerRef.current = setTimeout(() => {
-      setIsPlaying(false);
-      timerRef.current = null;
-    }, BEE_ANIMATION_DURATION);
-  }, [onTrigger]);
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
-  }, []);
-
-  return (
-    <img
-      className={className}
-      src={isPlaying ? beeFlyingIcon : beeStaticIcon}
-      alt={altText}
-      data-testid="chat-panel-welcome-banner"
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={onLeave}
-    />
-  );
-}
 
 /**
  * The chat surface stays mounted while the user inspects trajectory data.
@@ -1204,6 +1163,9 @@ export const ChatPanel = React.memo(function ChatPanel({
   topicStarterProjectId = null,
   historyPager = null,
   isHistoryRestoring = false,
+  conversationCreated = false,
+  npcSession = false,
+  headerActions,
   teamAreaExpanded = false,
   autoFocusKey = null,
   onNavigateToSkills,
@@ -1232,6 +1194,7 @@ export const ChatPanel = React.memo(function ChatPanel({
   onToggleDiagnosis,
 }: ChatPanelProps) {
   const { t } = useTranslation();
+  const workspaceQuotaEnabled = useWorkspaceQuotaEnabled();
   const workMode = useWorkspaceStore((state) => state.workMode);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const conversationId = useOrganizationConversationKey(activeSessionId);
@@ -1296,7 +1259,7 @@ export const ChatPanel = React.memo(function ChatPanel({
   const hasTimelineContent = messages.length > 0 || toolExecutionOrder.length > 0;
   // 还在等你点选时，不能退回首页欢迎语。提问卡片要留在普通聊天页里。
   const hasConversation = Boolean(
-    isHistoryRestoring || historyPager || hasTimelineContent || hasPendingQuestion,
+    npcSession || conversationCreated || isHistoryRestoring || historyPager || hasTimelineContent || hasPendingQuestion,
   );
   const isGroupCreateWelcome = welcomeVariant === 'group-create';
   const historyLoadedBatchSeq = historyPager?.loadedBatchSeq ?? 0;
@@ -1334,7 +1297,6 @@ export const ChatPanel = React.memo(function ChatPanel({
     exposureAcknowledged: boolean;
   } | null>(null);
   const [recommendationState, setRecommendationState] = useState("");
-  const [topicStarterRead, setTopicStarterRead] = useState<{ visitId: string; pending: boolean } | null>(null);
   const [recommendationRefresh, setRecommendationRefresh] = useState(0);
   const keepSlateOnRefreshRef = useRef(false);
   // The switch event lands before the re-read. Hold that state across the refresh so the
@@ -1350,10 +1312,6 @@ export const ChatPanel = React.memo(function ChatPanel({
   const visibleTopicSlate = topicStartersEnabled && dynamicSlate?.visitId === topicStarterVisitId
     ? dynamicSlate.slate : null;
   const visibleTopicSlateId = visibleTopicSlate?.slateId;
-  const topicStarterLoading = Boolean(
-    topicStartersEnabled && isConnected && activeSessionId && !hasConversation && !visibleTopicSlate &&
-    (topicStarterRead?.visitId !== topicStarterVisitId || topicStarterRead.pending),
-  );
   const acceptingDynamicRef = useRef(false);
   const interactedRecommendationVisitRef = useRef<string | null>(null);
   const topicStarterClickLatchRef = useRef<string | null>(null);
@@ -1380,7 +1338,7 @@ export const ChatPanel = React.memo(function ChatPanel({
   } = promptSuggestionBox;
   const nextInputSuggestionKey = nextInputSuggestions.map(item => item.suggestionId).join('\n');
   const shouldShowChatHeader = hasConversation;
-  const composerDockVisible = composerDocked && hasConversation;
+  const composerDockVisible = composerDocked && hasConversation && !npcSession;
   // Report the composer's measured height so the docked trajectory view can
   // keep its last records clear of it. A collapsed or undocked composer covers
   // nothing, so it reports zero rather than its laid-out size.
@@ -1409,22 +1367,23 @@ export const ChatPanel = React.memo(function ChatPanel({
   const shareExportTitle = isWaitingShareExportTab ? t('share.openExportTab') : isExportingShare && shareExportProgress
     ? shareExportProgress : getShareExportTitle(t, isExportingShare, canExportShare);
   const shouldShowShareExport = !isEnterprise() && Boolean(onExportShare);
-  const shouldShowHumanShare = mode === 'team' && teamHumanShareCommands.length > 0;
+  const shouldShowHumanShare = !isEnterprise() && mode === 'team' && teamHumanShareCommands.length > 0;
   const [humanShareOpen, setHumanShareOpen] = React.useState(false);
   const isAuthorized = useAuthStore((state) => state.islogin);
+  const showFreeModelsCampaign = !isEnterprise() && !isAuthorized;
   const [bubbleVisible, setBubbleVisible] = useState(false);
   const [topicBubbleActive, setTopicBubbleActive] = useState(false);
   const showTopicBubble = topicBubbleActive && recommendationState === 'disabled';
   const [freeModelsPromptDismissed, setFreeModelsPromptDismissed] = useState(false);
   const bubbleHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleBubbleShow = useCallback(() => {
-    if (!isAuthorized && freeModelsPromptDismissed && !showTopicBubble) return;
+    if (showFreeModelsCampaign && freeModelsPromptDismissed && !showTopicBubble) return;
     if (bubbleHideTimerRef.current) {
       clearTimeout(bubbleHideTimerRef.current);
       bubbleHideTimerRef.current = null;
     }
     setBubbleVisible(true);
-  }, [freeModelsPromptDismissed, isAuthorized, showTopicBubble]);
+  }, [freeModelsPromptDismissed, showFreeModelsCampaign, showTopicBubble]);
   const handleBubbleLeave = useCallback(() => {
     if (bubbleHideTimerRef.current) {
       clearTimeout(bubbleHideTimerRef.current);
@@ -1879,7 +1838,6 @@ export const ChatPanel = React.memo(function ChatPanel({
       return;
     }
     const requestSessionId = activeSessionId;
-    setTopicStarterRead({ visitId: topicStarterVisitId, pending: true });
     const requestParams = buildTopicStarterRequest(requestSessionId, topicStarterProjectId, workMode);
     let active = true;
     let receivedScopeState = false;
@@ -1929,7 +1887,9 @@ export const ChatPanel = React.memo(function ChatPanel({
     if (!keepSlateOnRefreshRef.current) setDynamicSlate(null);
     keepSlateOnRefreshRef.current = false;
     setTopicStarterErrorKey(null);
-    setRecommendationState(heldSwitchState ?? "");
+    // Disabling recommendations is global, not a project-specific loading state.
+    // Preserve it while the new scope is read so the bee hint does not change content/style.
+    setRecommendationState(current => heldSwitchState ?? (current === 'disabled' ? current : ""));
     // This read also serves a pool that became ready while the page was in the background.
     readyWhileHiddenRef.current = false;
     void webRequest<TopicStarterResponse>('topic_starters.get', {
@@ -1965,9 +1925,6 @@ export const ChatPanel = React.memo(function ChatPanel({
           setRecommendationState("failed");
         }
         console.error('topic_starters.get failed:', error);
-      })
-      .finally(() => {
-        if (active) setTopicStarterRead({ visitId: topicStarterVisitId, pending: false });
       });
     return () => {
       active = false;
@@ -2327,8 +2284,10 @@ export const ChatPanel = React.memo(function ChatPanel({
       {shouldShowChatHeader && (
         <div className="chat-panel-header" data-testid="chat-panel-header">
           <div className="chat-panel-header__meta" data-testid="chat-panel-header-meta">
-            <div className="chat-panel-header__title" title={sessionTitle} data-testid="chat-panel-header-title">
-              {sessionTitle}
+            <div className="flex min-w-0 items-center gap-2" data-testid="chat-panel-header-title-row">
+              <div className="chat-panel-header__title" title={sessionTitle} data-testid="chat-panel-header-title">
+                {sessionTitle}
+              </div>
             </div>
             {sessionProjectName && (
               <div
@@ -2340,6 +2299,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                 <span>{sessionProjectName}</span>
               </div>
             )}
+            <WebUIHost slotId="conversation.header.title.after" sessionId={activeSessionId} layout="row" />
           </div>
           <div className="chat-panel-header__actions" data-testid="chat-panel-header-actions">
             {diagnosisEntryAvailable && onToggleDiagnosis && (
@@ -2355,6 +2315,13 @@ export const ChatPanel = React.memo(function ChatPanel({
                 <ClipboardList size={16} strokeWidth={2} aria-hidden />
               </button>
             )}
+            <WebUIHost
+              slotId="conversation.header.actions"
+              sessionId={activeSessionId}
+              layout="row"
+              instanceClassName="flex min-w-0 items-center gap-2"
+              styles={pluginHeaderActionStyles}
+            />
             {composerDockVisible && onToggleComposerCollapsed && (
               <button
                 type="button"
@@ -2376,6 +2343,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                   : <PanelBottomClose size={16} strokeWidth={2} aria-hidden />}
               </button>
             )}
+            {headerActions}
             {shouldShowShareExport && (
               <button
                 type="button"
@@ -2421,7 +2389,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                 onClick={() => onToggleHeartbeatPanel?.()}
                 title={t('heartbeat.panel.title')}
               >
-                <Activity size={14} strokeWidth={2} />
+                <Activity size={18} strokeWidth={2} />
               </button>
             )}
             <button
@@ -2453,6 +2421,7 @@ export const ChatPanel = React.memo(function ChatPanel({
           </div>
         </div>
       )}
+      {workspaceQuotaEnabled ? <WorkspaceQuotaBanner /> : null}
       {hasHarnessProgress && (
         <div
           className="sticky top-0 z-10 px-3 pt-2 bg-bg/95 backdrop-blur-sm"
@@ -2461,7 +2430,9 @@ export const ChatPanel = React.memo(function ChatPanel({
           <HarnessProgressBar />
         </div>
       )}
-      {humanShareOpen && <HumanSharePanel commands={teamHumanShareCommands} onClose={() => setHumanShareOpen(false)} />}
+      {shouldShowHumanShare && humanShareOpen && (
+        <HumanSharePanel commands={teamHumanShareCommands} onClose={() => setHumanShareOpen(false)} />
+      )}
       <div
         ref={scrollContainerRef}
         className="chat-scroll flex-1 overflow-y-auto"
@@ -2499,7 +2470,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                     <HumanShareCard commands={teamHumanShareCommands} onShare={() => setHumanShareOpen(true)} />
                   )}
                   {/* 内联审批卡片（演进审批 & 权限审批共用） */}
-                  <InlineQuestionCard onSubmit={onUserAnswer} />
+                  {!npcSession && <InlineQuestionCard onSubmit={onUserAnswer} />}
                   <ContextCompressionLines runtime={contextCompressionRuntime} summary={contextCompressionSummary} />
                   <MoaProgress phase={moaPhase} />
                 </>
@@ -2529,14 +2500,14 @@ export const ChatPanel = React.memo(function ChatPanel({
                 />
               )}
               <h2 className="chat-welcome__heading" data-testid="chat-panel-welcome-heading">
-                {isGroupCreateWelcome ? <GroupCreateWelcomeHeading /> : <WelcomeHeading />}
+                {isGroupCreateWelcome ? <GroupCreateWelcomeHeading /> : <WelcomeHeading workMode={workMode} />}
               </h2>
               <div className="chat-welcome__composer" data-testid="chat-panel-welcome-composer">
                 {!isGroupCreateWelcome && (
                   <>
                     <div
                       ref={bubbleRef}
-                      className={`chat-welcome__banner chat-welcome__banner--bubble${showTopicBubble || !isAuthorized ? ' chat-welcome__banner--bubble--campaign' : ''}${bubbleVisible ? ' chat-welcome__banner--bubble--visible' : ''}`}
+                      className={`chat-welcome__banner chat-welcome__banner--bubble${showTopicBubble || showFreeModelsCampaign ? ' chat-welcome__banner--bubble--campaign' : ''}${bubbleVisible ? ' chat-welcome__banner--bubble--visible' : ''}`}
                       data-testid="chat-panel-welcome-banner-bubble"
                       onMouseEnter={handleBubbleShow}
                       onMouseLeave={handleBubbleLeave}
@@ -2553,7 +2524,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                             {t('chat.topicStarter.trySettings')}
                           </button>
                         </>
-                      ) : isAuthorized ? (
+                      ) : !showFreeModelsCampaign ? (
                         t('chat.welcomeBubbleText')
                       ) : (
                         <>
@@ -2584,17 +2555,18 @@ export const ChatPanel = React.memo(function ChatPanel({
                         </>
                       )}
                     </div>
-                    <BeeBanner
+                    <WelcomeMascot
                       className="chat-welcome__banner chat-welcome__banner--bee"
                       altText={t('chat.welcomeLogoAlt')}
                       onTrigger={() => {
-                        setTopicBubbleActive(false);
+                        if (!showTopicBubble || !bubbleVisible) setTopicBubbleActive(false);
                         handleBubbleShow();
                       }}
                       onLeave={handleBubbleLeave}
                     />
                   </>
                 )}
+                <WebUIHost slotId="conversation.input.above" className="chat-input-webui-above" />
                 <ActiveTeamGroupEntry isProcessing={isProcessing} teamAreaExpanded={teamAreaExpanded} />
                 <AgentActivityCard isProcessing={isProcessing} onSendTask={handleSendMessage} onContinueQueuedSessionMessages={onContinueQueuedSessionMessages} />
                 <InterruptResultBubble />
@@ -2624,18 +2596,10 @@ export const ChatPanel = React.memo(function ChatPanel({
                   onRefreshGoal={onRefreshGoal}
                   onClearGoal={onClearGoal}
                 />
+                <WebUIHost slotId="conversation.input.below" className="mt-1 px-1 min-h-10 max-h-none" />
               </div>
               {topicStartersEnabled && <div className="chat-suggestions" data-testid="chat-panel-welcome-suggestions">
-                {topicStarterLoading ? (
-                  <div
-                    className="chat-suggestions__title"
-                    role="status"
-                    aria-live="polite"
-                    data-testid="chat-panel-topic-loading"
-                  >
-                    {t('chat.topicStarter.statusLoading')}
-                  </div>
-                ) : recommendationState !== 'disabled' && topicStarterShowsStatus(recommendationState, Boolean(visibleTopicSlate)) ? (
+                {recommendationState !== 'disabled' && topicStarterShowsStatus(recommendationState, Boolean(visibleTopicSlate)) ? (
                   <div
                     className="chat-suggestions__title"
                     role="status"
@@ -2708,8 +2672,14 @@ export const ChatPanel = React.memo(function ChatPanel({
         </div>
       </div>
 
-      {hasConversation && (
+      {npcSession && (
+        <div className="shrink-0 px-4 py-3 text-center text-sm text-text-muted" data-testid="chat-panel-npc-read-only">
+          {t('chat.npcSessionReadOnly')}
+        </div>
+      )}
+      {hasConversation && !npcSession && (
         <div ref={composeRef} className="chat-compose" data-testid="chat-panel-compose">
+          <WebUIHost slotId="conversation.input.above" className="chat-input-webui-above" />
           <ActiveTeamGroupEntry isProcessing={isProcessing} teamAreaExpanded={teamAreaExpanded} />
           <AgentActivityCard isProcessing={isProcessing} onSendTask={handleSendMessage} onContinueQueuedSessionMessages={onContinueQueuedSessionMessages} />
           <InterruptResultBubble />
@@ -2750,6 +2720,7 @@ export const ChatPanel = React.memo(function ChatPanel({
             onClearGoal={onClearGoal}
             onDrainTaskQueueIfIdle={onDrainTaskQueueIfIdle}
           />
+          <WebUIHost slotId="conversation.input.below" className="mt-1 px-1 min-h-10 max-h-none" />
         </div>
       )}
       <div className="chat-ai-disclaimer" data-testid="chat-panel-ai-disclaimer">

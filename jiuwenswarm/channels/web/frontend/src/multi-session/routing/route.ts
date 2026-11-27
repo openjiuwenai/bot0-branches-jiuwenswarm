@@ -14,6 +14,10 @@ function withBasePath(pathname: string): string {
   return `${basePath()}${pathname}`;
 }
 
+export function appRoutePath(pathname: string): string {
+  return withBasePath(pathname.startsWith('/') ? pathname : `/${pathname}`);
+}
+
 export function parseChatRoute(pathname: string): ChatRoute | null {
   const base = basePath();
   if (base && pathname !== base && !pathname.startsWith(`${base}/`)) return null;
@@ -23,6 +27,7 @@ export function parseChatRoute(pathname: string): ChatRoute | null {
   if (path === '/groups') return { kind: 'group-chat' };
   const groupMatch = path.match(/^\/groups\/([^/]+)$/);
   if (groupMatch) return { kind: 'group-chat', groupId: decodeURIComponent(groupMatch[1]) };
+  if (path === '/system-plugin-recovery') return { kind: 'chat-new' };
   const designSessionMatch = path.match(/^\/design\/([^/]+)\/([^/]+)$/);
   if (designSessionMatch) {
     return {

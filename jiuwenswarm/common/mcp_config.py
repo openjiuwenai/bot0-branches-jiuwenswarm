@@ -265,6 +265,160 @@ def build_enabled_mcp_server_configs(
     return configs
 
 
+def _mcp_state() -> Any:
+    """The MCP state store module, via the common injection point.
+
+    Layering rule R1: ``common`` never imports ``jiuwenswarm.server`` directly —
+    the store self-registers as ``provider("mcp_state")`` on import. The
+    module-level ``provider`` is used (no local import: G.VAR.03 shadowing).
+    """
+    return provider("mcp_state")
+
+
+def _connector_skill_dirs(skills_root: str, disabled: set[str]) -> list[str]:
+    """One absolute directory per bundled Skill (a child holding ``SKILL.md``)."""
+    root = os.path.abspath(skills_root)
+    try:
+        children = sorted(os.listdir(root))
+    except OSError:
+        return []
+    dirs: list[str] = []
+    for child in children:
+        if child.startswith("."):
+            continue
+        if child in disabled:
+            continue
+        if os.path.isfile(os.path.join(root, child, "SKILL.md")):
+            dirs.append(os.path.join(root, child))
+    return dirs
+
+
+def _connector_server_entries() -> dict[str, dict[str, Any]]:
+    """Name → server entry, degrading to empty when the merged source fails.
+
+    Same defensive read as :func:`extract_enabled_mcp_server_entries`: early
+    bootstrap / an unreadable store must not fail the member build.
+    """
+    try:
+        from jiuwenswarm.common.config import get_mcp_servers
+
+        return {
+            str(item.get("name", "") or "").strip(): item
+            for item in get_mcp_servers()
+            if isinstance(item, dict)
+        }
+    except Exception as exc:  # noqa: BLE001 — degrade, like the sibling reader
+        logger.warning("[mcp_config] connector server entries unavailable: %s", exc)
+        return {}
+
+
+def _connector_skills_roots() -> dict[str, str]:
+    """Name → bundled-skills root of the connected MCPs, degrading per entry.
+
+    One malformed record (missing ``name``/``dir``) is skipped, matching the
+    per-entry defense of :func:`_connector_server_entries`, so it cannot drop
+    every connector's Skills at once.
+    """
+    try:
+        items = _mcp_state().connected_mcp_skill_dirs()
+    except Exception as exc:  # noqa: BLE001 — degrade; state read via the provider
+        logger.warning("[mcp_config] connector skill dirs unavailable: %s", exc)
+        return {}
+    roots: dict[str, str] = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        directory = str(item.get("dir") or "").strip()
+        if name and directory:
+            roots[name] = directory
+    return roots
+
+
+def _connector_state_record(name: str) -> dict[str, Any] | None:
+    """One connector's state record, degrading to None on a bad read."""
+    try:
+        return _mcp_state().get_mcp_record(name)
+    except Exception as exc:  # noqa: BLE001 — one bad read skips one connector
+        logger.warning("[mcp_config] connector %s state read failed: %s", name, exc)
+        return None
+
+
+def _connector_mcp_config(
+    name: str,
+    entry: dict[str, Any],
+    server_id_scope: str | None,
+) -> McpServerConfig | None:
+    """Build one connector's server config with credentials, degrading to None."""
+    try:
+        cfg = build_mcp_server_config(
+            entry,
+            server_id_scope=server_id_scope,
+            credential_resolver=build_mcp_credential_resolver(name),
+            resolve_node_launcher=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — one bad connector must not drop the rest
+        logger.warning("[mcp_config] connector %s server skipped: build failed: %s", name, exc)
+        return None
+    if cfg is None:
+        logger.warning("[mcp_config] connector %s server skipped: invalid server entry", name)
+    return cfg
+
+
+def resolve_connectors(
+    names: list[str],
+    *,
+    server_id_scope: str | None = None,
+    disabled_skills: set[str] | None = None,
+) -> tuple[list[McpServerConfig], list[str]]:
+    """Resolve connectors into MCP server configs and bundled Skill directories.
+
+    Used for an expert member's template connectors (``mcps[].connector``):
+    readiness follows the single-agent gate (``state == "connected"``); the
+    TUI-only ``enabled`` flag is ignored. Each connected connector contributes
+    whatever it has — its MCP server (credentials resolved) and its bundled
+    Skills under ``mcp/skills/<name>/``; Skills in ``disabled_skills`` (the
+    caller's switched-off set) are left out. Unknown, unready or empty
+    connectors are logged and skipped, and failing data sources degrade to
+    empty, so this never fails the member build.
+
+    Returns:
+        ``(mcp_configs, skill_dirs)`` — skill dirs are absolute, one per Skill.
+    """
+    wanted: list[str] = []
+    for raw in names or []:
+        name = str(raw or "").strip()
+        if name and name not in wanted:
+            wanted.append(name)
+    if not wanted:
+        return [], []
+    entries = _connector_server_entries()
+    skills_roots = _connector_skills_roots()
+    disabled = set(disabled_skills or ())
+    configs: list[McpServerConfig] = []
+    skill_dirs: list[str] = []
+    for name in wanted:
+        rec = _connector_state_record(name)
+        if not isinstance(rec, dict) or rec.get("state") != "connected":
+            logger.warning(
+                "[mcp_config] connector %s skipped: not connected (state=%s)",
+                name,
+                rec.get("state") if isinstance(rec, dict) else None,
+            )
+            continue
+        dirs = _connector_skill_dirs(skills_roots[name], disabled) if name in skills_roots else []
+        skill_dirs.extend(d for d in dirs if d not in skill_dirs)
+        entry = entries.get(name)
+        if entry is None:
+            if not dirs:
+                logger.warning("[mcp_config] connector %s skipped: no server entry and no skills", name)
+            continue
+        cfg = _connector_mcp_config(name, entry, server_id_scope)
+        if cfg is not None:
+            configs.append(cfg)
+    return configs, skill_dirs
+
+
 async def preflight_mcp_server_reachable(
     cfg: McpServerConfig,
     *,
@@ -327,11 +481,21 @@ async def preflight_mcp_server_reachable(
     if isinstance(auth_headers, dict):
         headers.update({str(k): str(v) for k, v in auth_headers.items()})
     # auth_query_params goes to the URL query string, matching the real connect.
+    # httpx *replaces* the URL's own query with the ``params`` argument — even
+    # an empty dict drops a configured ``?appId=...`` from server_path. The real
+    # connect merges instead (``URL.copy_merge_params`` in the auth provider), so
+    # merge here too: the URL query survives, auth keys win on collisions, and
+    # an empty auth_query_params leaves the URL untouched.
     query_params = getattr(cfg, "auth_query_params", None)
-    if isinstance(query_params, dict):
-        query_params = {str(k): str(v) for k, v in query_params.items()}
-    else:
-        query_params = None
+    if isinstance(query_params, dict) and query_params:
+        try:
+            url = str(
+                httpx.URL(url).copy_merge_params(
+                    {str(k): str(v) for k, v in query_params.items()}
+                )
+            )
+        except httpx.InvalidURL as exc:
+            return False, f"invalid url: {exc}"
 
     # Body must mirror the mcp SDK's initialize exactly: some gateways (e.g.
     # GitHub Copilot) return a body-format 400 before auth, masking a real 401.
@@ -402,7 +566,7 @@ async def preflight_mcp_server_reachable(
                 # healthy SSE endpoint answers 2xx plus an endless event
                 # stream, so the body must never be fully read.
                 headers["Accept"] = "text/event-stream"
-                request = http.build_request("GET", url, headers=headers, params=query_params)
+                request = http.build_request("GET", url, headers=headers)
                 resp = await http.send(request, stream=True)
                 try:
                     if resp.status_code in (401, 403):
@@ -418,7 +582,7 @@ async def preflight_mcp_server_reachable(
                     return True, f"ok (http {resp.status_code})"
                 finally:
                     await resp.aclose()
-            resp = await http.post(url, headers=headers, params=query_params, content=body)
+            resp = await http.post(url, headers=headers, content=body)
     except httpx.TimeoutException as exc:
         return False, f"http probe timed out after {read_t}s (server not responding): {type(exc).__name__}"
     except (httpx.ConnectError, httpx.NetworkError, httpx.UnsupportedProtocol) as exc:
@@ -669,39 +833,82 @@ async def probe_mcp_live_connection(name: str) -> tuple[bool, str]:
     return True, ""
 
 
-async def prewarm_connected_mcps(*, report_status: bool = False) -> bool | None:
+async def discard_probed_mcp(name: str) -> None:
+    """Drop the instance a successful probe cached for a cancelled connect.
+
+    ``probe_mcp_live_connection`` keeps it in the process-level
+    ``Runner.resource_mgr``; after a cancel the record is rolled back, so the
+    cached connection (and its stdio child) must not outlive it.
+    """
+    from openjiuwen.core.runner import Runner
+
+    # Fresh task: closing an SSE client's anyio scope in the caller's task
+    # raises "exit cancel scope in a different task".
+    task = asyncio.create_task(
+        Runner.resource_mgr.remove_mcp_server(server_name=name, ignore_exception=True)
+    )
+    try:
+        await asyncio.wait_for(task, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
+        logger.warning("[mcp-config] discard probed MCP '%s' failed: %s", name, exc)
+
+
+async def prewarm_connected_mcps(
+    *, report_status: bool = False, settle_connecting: bool = False
+) -> bool | None:
     """Prewarm ``Runner.resource_mgr`` for every ``state==connected`` MCP.
 
     Probes each so a later ``chat.send`` reconcile hits the existing-entry
-    branch (no re-spawn). Failure-isolated per MCP and never downgrades state.
-    Safe to call at startup and again from the root adapter (idempotent).
+    branch (no re-spawn). Connected records are never downgraded.
 
-    ``report_status`` returns whether every probe succeeded for capability
-    readiness. The default retains the existing best-effort ``None`` result.
+    ``settle_connecting`` additionally probes leftover ``connecting`` records
+    and settles them to connected or a retryable state, so a connect interrupted
+    by a crash cannot strand the UI on "connecting".
 
-    Background fire-and-forget — the service never awaits this task, so a
-    slow/cold MCP probe (npx first-install ~30s, HTTP connect) is allowed to
-    take as long as it needs; only a genuine deadlock (stuck well beyond what
-    probe's internal preflight/connect would take) is bounded by a generous
-    stall timeout.  A semaphore caps concurrency so N simultaneous spawns
-    don't overwhelm the host during startup.
+    ``report_status`` returns whether every connected probe succeeded for
+    capability readiness; connecting records never affect readiness.
+
+    Best-effort background task: slow/cold probes may take as long as they need
+    (only a genuine stall hits the timeout), and a semaphore caps concurrency.
     """
     try:
-        names = [
+        state = provider("mcp_state")
+        connected_names = [
             str(r.get("name", "")).strip()
-            for r in provider("mcp_state").list_truly_connected_mcps()
+            for r in state.list_truly_connected_mcps()
             if r.get("name")
         ]
+        connecting_names: list[str] = []
+        if settle_connecting:
+            connecting_names = [
+                str(r.get("name", "")).strip()
+                for r in state.list_connecting_mcps()
+                if r.get("name")
+            ]
+        names = [*connected_names, *connecting_names]
         if not names:
             return True if report_status else None
         logger.info(
-            "[mcp-prewarm] prewarming %d connected MCP(s): %s",
-            len(names), names,
+            "[mcp-prewarm] prewarming %d connected MCP(s), settling %d connecting: %s",
+            len(connected_names), len(connecting_names), names,
         )
+        connected_set = set(connected_names)
+        connecting_set = set(connecting_names)
+        mcp_registry = None
+        if connecting_set:
+            try:
+                mcp_registry = provider("mcp_registry")
+            except Exception as exc:  # noqa: BLE001 - settling is best-effort
+                logger.warning(
+                    "[mcp-prewarm] mcp_registry provider unavailable; "
+                    "connecting MCPs will not be settled: %s", exc,
+                )
 
         sem = asyncio.Semaphore(_PREWARM_MAX_CONCURRENCY)
 
         async def _probe_one(name: str) -> bool:
+            ok = False
+            reason = ""
             async with sem:
                 try:
                     # Only a genuine stall (>> probe's expected worst case)
@@ -710,31 +917,30 @@ async def prewarm_connected_mcps(*, report_status: bool = False) -> bool | None:
                         probe_mcp_live_connection(name),
                         timeout=_PREWARM_STALL_TIMEOUT_S,
                     )
-                    if ok:
-                        logger.info("[mcp-prewarm] '%s' prewarmed", name)
-                    else:
-                        logger.warning(
-                            "[mcp-prewarm] '%s' prewarm failed: %s "
-                            "(will lazy-connect on first chat)", name, reason,
-                        )
-                    return bool(ok)
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        "[mcp-prewarm] '%s' prewarm stalled >%.0fs "
-                        "and was skipped (will lazy-connect on first chat)",
-                        name, _PREWARM_STALL_TIMEOUT_S,
-                    )
+                    reason = f"stalled >{_PREWARM_STALL_TIMEOUT_S:.0f}s"
                 except Exception as exc:  # noqa: BLE001
+                    reason = f"{type(exc).__name__}: {exc}"
+                if ok:
+                    logger.info("[mcp-prewarm] '%s' prewarmed", name)
+                else:
                     logger.warning(
-                        "[mcp-prewarm] '%s' prewarm error: %s", name, exc,
+                        "[mcp-prewarm] '%s' prewarm failed: %s "
+                        "(will lazy-connect on first chat)", name, reason,
                     )
-                return False
+                if mcp_registry is not None and name in connecting_set:
+                    await asyncio.to_thread(
+                        mcp_registry.settle_connecting_mcp, name, probe_ok=ok
+                    )
+                return ok
 
         # Concurrent probes bounded by semaphore — all MCPs start in parallel
         # but at most N execute add_mcp_server at any moment.  Total wall time
         # ≈ the slowest probe alone (not N×), with stall protection only.
         results = await asyncio.gather(*[_probe_one(name) for name in names])
-        return all(results) if report_status else None
+        if not report_status:
+            return None
+        return all(ok for name, ok in zip(names, results) if name in connected_set)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[mcp-prewarm] background prewarm failed: %s", exc)
         return False if report_status else None
@@ -767,6 +973,7 @@ __all__ = [
     "build_enabled_mcp_server_configs",
     "build_mcp_credential_resolver",
     "build_mcp_server_config",
+    "resolve_connectors",
     "extract_enabled_mcp_server_entries",
     "preflight_mcp_server_reachable",
     "prewarm_connected_mcps",

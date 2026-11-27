@@ -99,6 +99,7 @@ test('group routes support refresh, IDs and existing chat routes', () => {
   assert.deepEqual(parseChatRoute(chatRoutePath(route)), route);
   assert.deepEqual(parseChatRoute('/chat/new'), { kind: 'chat-new' });
   assert.deepEqual(parseChatRoute('/chat/session'), { kind: 'chat-session', sessionId: 'session' });
+  assert.deepEqual(parseChatRoute('/system-plugin-recovery'), { kind: 'chat-new' });
 });
 
 test('attachment links reject executable and protocol-relative URLs', () => {
@@ -208,6 +209,9 @@ test('management uses group APIs and keeps pagination and member request IDs', a
   const member = { kind: 'agent_group', id: 'review-team', member_name: 'review' };
   const added = await groupChatClient.addMember('group-one', member, 'stable-add');
   assert.deepEqual(added.params, { group_id: 'group-one', member, client_request_id: 'stable-add' });
+  const memberRemoved = await groupChatClient.removeMember('group-one', 'review', 'stable-remove');
+  assert.equal(memberRemoved.method, 'group.member.remove');
+  assert.deepEqual(memberRemoved.params, { group_id: 'group-one', member_name: 'review', client_request_id: 'stable-remove' });
 });
 
 test('task results match exact execution or message IDs and the actual member', () => {
@@ -645,7 +649,8 @@ test('owner routing restores pending chat and closes only its exact request afte
   const members = ['owner', 'other'].map((member_name) => ({ member_name, kind: 'agent_group' }));
   const ask = (id) => ({ ...message(id, 1000), client_message_id: id, sender: 'user', mentions: ['owner', 'other'] });
   const routes = ['one', 'two'].map((plan_id) => ({ plan_id, owner_member: 'owner', members: ['owner', 'other'], status: 'pending' }));
-  const pending = (rs) => pendingMentionReplies([ask('one'), ask('two')], [], members, new Set(), rs);
+  const ownerReply = { ...message('reply', 2000), sender: 'owner' };
+  const pending = (rs) => pendingMentionReplies([ask('one'), ask('two'), ownerReply], [], members, new Set(), rs);
   assert.equal(pending(routes).size, 2);
   assert.equal(pending(routes).get('one')[0].memberName, 'owner');
   assert.equal(mentionExecutionPhase(undefined, true, routes[0]).key, 'organizationPending');
@@ -706,4 +711,97 @@ test('only interrupted organization cards explain runtime loss', () => {
   for (const kind of ['team', 'agent']) {
     assert.doesNotMatch(render(kind, 'interrupted'), /group-chat-organization-interrupted/);
   }
+});
+
+test('members notified by the auto-reply judgement wait like mentioned ones, each on its own', async () => {
+  const { pendingMentionReplies } = await import('../node_modules/.cache/group-chat/features/groupChat/state.js');
+  const members = [
+    { member_name: 'lab', display_name: 'Lab', kind: 'agent_group' },
+    { member_name: 'studio', display_name: 'Studio', kind: 'agent_group' },
+    { member_name: 'mate', display_name: 'Mate', kind: 'colleague' },
+  ];
+  const ask = (id, at, mentions = []) => ({
+    message_id: id, client_message_id: `client-${id}`, sender: 'user', content: 'question', timestamp: at, mentions,
+  });
+  const waiting = (pending) => Object.fromEntries([...pending].map(([id, items]) =>
+    [id, items.map((item) => `${item.memberName}${item.organization ? ':org' : ''}`)]));
+  const sent = new Set(['client-m1']);
+  const decided = (status, notified) => ({ m1: { status, notified } });
+
+  // Two notified expert teams answer separately; only explicit mentions form an organization.
+  assert.deepEqual(waiting(pendingMentionReplies(
+    [ask('m1', 1000)], [], members, sent, [], decided('notified', ['lab', 'studio', 'mate']), 5000,
+  )), { m1: ['lab', 'studio', 'mate'] });
+  assert.deepEqual(waiting(pendingMentionReplies(
+    [ask('m1', 1000, ['lab', 'studio'])], [], members, sent, [], decided('notified', ['mate']), 5000,
+  )), { m1: ['lab:org'] });
+  // A reply clears that member only; undecided or empty judgements leave nothing waiting.
+  assert.deepEqual(waiting(pendingMentionReplies(
+    [ask('m1', 1000), { ...ask('r1', 2000), sender: 'lab' }], [], members, sent, [],
+    decided('notified', ['lab', 'mate']), 5000,
+  )), { m1: ['mate'] });
+  for (const status of ['pending', 'none', 'failed']) {
+    assert.deepEqual(waiting(pendingMentionReplies([ask('m1', 1000)], [], members, sent, [], decided(status, []))), {});
+  }
+  assert.deepEqual(waiting(pendingMentionReplies([ask('m1', 1000)], [], members, sent)), {});
+  // A notified member may stay silent; its bubble ends after the wait, while a mentioned member keeps waiting.
+  const late = 1000 + 3 * 60 * 1000 + 1;
+  assert.deepEqual(waiting(pendingMentionReplies(
+    [ask('m1', 1000)], [], members, sent, [], decided('notified', ['mate']), late - 2,
+  )), { m1: ['mate'] });
+  assert.deepEqual(waiting(pendingMentionReplies(
+    [ask('m1', 1000)], [], members, sent, [], decided('notified', ['mate']), late,
+  )), {});
+  assert.deepEqual(waiting(pendingMentionReplies([ask('m1', 1000, ['mate'])], [], members, sent, [], {}, late)),
+    { m1: ['mate'] });
+});
+
+test('a joint auto-reply decision shows only its owner before and after the candidate arrives', async () => {
+  const { pendingMentionReplies, autoReplyNotice, AUTO_REPLY_WAIT_MS } = await import('../node_modules/.cache/group-chat/features/groupChat/state.js');
+  const members = [{ member_name: 'finance', kind: 'agent_group', display_name: 'Finance' },
+    { member_name: 'ppt', kind: 'agent_group' }, { member_name: 'expert', kind: 'agent_template' }];
+  const ask = { message_id: 'm1', client_message_id: 'ask', sender: 'user', timestamp: 1000, content: 'report', mentions: [] };
+  const joint = { m1: { status: 'notified', notified: ['finance'], organization: { owner: 'finance', members: ['finance', 'ppt'] } } };
+  const pending = (replies, routes = [], now = 2000, sent = new Set()) =>
+    pendingMentionReplies([ask], [], members, sent, routes, replies, now).get('m1');
+
+  // The candidate event may arrive after the decision; other teams never get a bubble of their own.
+  const early = pending(joint);
+  assert.deepEqual(early.map((item) => [item.memberName, item.organization]), [['finance', true]]);
+  const route = { plan_id: 'ask', owner_member: 'finance', members: ['finance', 'ppt'], status: 'pending' };
+  assert.deepEqual(pending(joint, [route]).map((item) => [item.memberName, item.route]), [['finance', route]]);
+  // A decision whose candidate never appears stops waiting like any other auto reply.
+  assert.equal(pending(joint, [], 1000 + AUTO_REPLY_WAIT_MS + 1), undefined);
+
+  // Separate notifications keep one independent bubble per member.
+  const separate = pending({ m1: { status: 'notified', notified: ['finance', 'ppt'] } }, [], 2000, new Set(['ask']));
+  assert.deepEqual(separate.map((item) => [item.memberName, Boolean(item.organization)]), [['finance', false], ['ppt', false]]);
+
+  assert.deepEqual(autoReplyNotice(joint.m1, members, ', '),
+    { key: 'groupChat.autoReply.coordinated', values: { owner: 'Finance', names: 'Finance, ppt' } });
+  assert.deepEqual(autoReplyNotice({ status: 'notified', notified: ['finance', 'expert'] }, members, ', '),
+    { key: 'groupChat.autoReply.notified', values: { names: 'Finance, expert' } });
+  assert.deepEqual(autoReplyNotice({ status: 'none', notified: [] }, members, ', '), { key: 'groupChat.autoReply.none' });
+});
+
+test('removed member stops pending mention placeholders and detects active work accurately', async () => {
+  const { pendingMentionReplies, memberHasActiveWork, autoReplyNotice } = await import('../node_modules/.cache/group-chat/features/groupChat/state.js');
+  const activeMembers = [{ member_name: 'writer', kind: 'agent_template', display_name: 'Writer' }];
+  const formerMembers = [{ member_name: 'xiaojiu', kind: 'colleague', display_name: '小九' }];
+  const ask = { message_id: 'm1', client_message_id: 'ask-1', sender: 'user', timestamp: 1000, content: '@小九 帮我看看', mentions: ['xiaojiu'] };
+
+  // Departed member with no running execution no longer stays pending.
+  assert.equal(pendingMentionReplies([ask], [], activeMembers, new Set(['ask-1'])).get('m1'), undefined);
+
+  // History auto-reply notice preserves departed member display_name when former_members is included.
+  assert.deepEqual(
+    autoReplyNotice({ status: 'notified', notified: ['xiaojiu'] }, [...activeMembers, ...formerMembers], '、'),
+    { key: 'groupChat.autoReply.notified', values: { names: '小九' } },
+  );
+
+  // Active work detection covers running executions and non-terminal organization routes.
+  assert.equal(memberHasActiveWork('writer', [{ execution_id: 'e1', member_name: 'writer', status: 'running' }], []), true);
+  assert.equal(memberHasActiveWork('writer', [{ execution_id: 'e1', member_name: 'writer', status: 'completed' }], []), false);
+  assert.equal(memberHasActiveWork('lab', [], [{ plan_id: 'p1', owner_member: 'studio', members: ['studio', 'lab'], status: 'pending' }]), true);
+  assert.equal(memberHasActiveWork('lab', [], [{ plan_id: 'p1', owner_member: 'studio', members: ['studio', 'lab'], status: 'completed' }]), false);
 });

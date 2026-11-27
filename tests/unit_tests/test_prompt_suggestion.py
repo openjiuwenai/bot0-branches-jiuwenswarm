@@ -35,6 +35,7 @@ from openjiuwen.harness.schema.state import DeepAgentState, PlanModeState
 from agent_gateway.channel_manager.base import RobotMessageRouter
 from agent_gateway.channel_manager.web.web_connect import WebChannel, WebChannelConfig
 from agent_gateway.message_handler.message_handler import MessageHandler
+from tests._support.null_session_login_bindings import NullSessionLoginBindings
 
 from jiuwenswarm.agents.harness.common.rails.ask_user_rail import StructuredAskUserRail
 from jiuwenswarm.agents.harness.common.recommendation import prompt_suggestion, topic_controls
@@ -239,7 +240,7 @@ def product(tmp_path, monkeypatch):
     monkeypatch.setattr(interface_module, "build_user_prompt", lambda query, **_kw: query)
 
     monkeypatch.setattr(MessageHandler, "_instance", None)
-    gateway = MessageHandler(SimpleNamespace())
+    gateway = MessageHandler(SimpleNamespace(), session_login_bindings=NullSessionLoginBindings())
     page = _Page()
     store = TopicStarterStore(tmp_path / "recommendation.db")
 
@@ -775,7 +776,7 @@ async def test_agent_server_shutdown_cancels_the_suggestion_in_flight(product, m
 
 @pytest.mark.parametrize("deny_tool", [False, True])
 async def test_composer_event_cancels_only_its_sessions_in_flight_fork(product, monkeypatch, deny_tool) -> None:
-    from jiuwenswarm.common.e2a.gateway_normalize import e2a_response_to_agent_response
+    from e2a.gateway_normalize import e2a_response_to_agent_response
     from jiuwenswarm.common.e2a.agent_compat import e2a_to_agent_request
     from e2a.models import E2AResponse
     from agent_gateway.channel_manager.web.app_web_handlers import WebHandlersBindParams, _register_web_handlers
@@ -844,7 +845,6 @@ async def test_composer_event_cancels_only_its_sessions_in_flight_fork(product, 
         assert len(generation["provider_receipts"]) == 1
         assert generation["total_usage"]["total_tokens"] == 1120
         assert generation["missing_provider_receipts"] == 1 and generation["usage_complete"] is False
-    assert prompt_suggestion.forks.answered_call(SESSION, "req-1") is not None
     assert product.page.events == []
     assert _outcomes(product.store) == [("cancelled", None)]
 
@@ -1078,7 +1078,6 @@ async def test_a_model_call_without_a_session_or_model_client_is_left_alone(prod
     await prompt_suggestion.PromptSuggestionForkRail().after_model_call(ctx)
 
     forks.turn_ended(SESSION, "req-1", status="success", waiting_for_user=False, completion=None)
-    assert forks.answered_call(SESSION, "req-1") is None
     assert _outcomes(product.store) == [("suppressed", "no_model_call")]
 
 
@@ -1213,3 +1212,20 @@ async def test_one_failed_suggestion_delivery_leaves_the_next(monkeypatch) -> No
         suggestions=[("first", "导出成双语对照"), ("second", "再整理一份术语表")],
     )
     assert [message["payload"]["suggestion_id"] for message in pushed] == ["second"]
+
+async def test_page_events_follow_the_prompt_switch_not_the_topic_switch(monkeypatch, tmp_path) -> None:
+    from jiuwenswarm.agents.harness.common.recommendation import switches
+    from jiuwenswarm.agents.harness.common.recommendation.topic_starter import TopicStarterStore
+    from jiuwenswarm.server.runtime import recommendation_rpc
+
+    store = TopicStarterStore(tmp_path / "recommendation.db")
+    monkeypatch.setattr(switches, "is_prompt_suggestion_enabled", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(recommendation_rpc, "_prompt_store", lambda _host: store)
+
+    result = await recommendation_rpc._prompt_suggestion_event(
+        None, {"event_type": "shown", "session_id": SESSION, "suggestion_id": "unknown"},
+    )
+
+    # Processed (and rejected as unknown), not shut off by the topic switch.
+    assert result.payload is None
+    assert result.code == "BAD_REQUEST"

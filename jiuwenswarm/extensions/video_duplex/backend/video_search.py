@@ -322,8 +322,8 @@ async def execute_core_agent(
     model_auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one delegated video task through the standard, full Core Agent API."""
-    from jiuwenswarm.common.e2a.constants import E2A_MODEL_AUTH_PARAM_KEY
-    from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
+    from e2a.constants import E2A_MODEL_AUTH_PARAM_KEY
+    from jiuwenswarm.common.e2a.request_wire import e2a_from_agent_fields
     from jiuwenswarm.common.schema.message import ReqMethod
 
     client = (
@@ -442,7 +442,9 @@ async def execute_core_agent(
                                        detail="\n".join(q["question"] for q in pending_interaction["questions"])))
             continue
         if event_type == "chat.error":
-            raise RuntimeError(
+            from jiuwenswarm.extensions.video_duplex.backend.tasks.errors import CoreExecutionError
+
+            raise CoreExecutionError(
                 str(
                     payload.get("error")
                     or payload.get("content")

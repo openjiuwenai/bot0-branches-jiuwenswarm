@@ -74,7 +74,12 @@ export const JIUWENMATE_METHODS = {
 export interface JiuwenMateDingTalkAuthStatus {
   status: 'unavailable' | 'not_connected' | 'authorizing' | 'connected' | 'error';
   cli_version: string | null;
-  error_code?: 'org_access_denied' | 'authorization_expired' | 'authorization_failed';
+  error_code?:
+    | 'org_access_denied'
+    | 'authorization_expired'
+    | 'authorization_failed'
+    | 'authorization_process_unverified'
+    | 'authorization_cleanup_failed';
   operation_id?: string;
   auth_url?: string;
   user_code?: string;
@@ -827,6 +832,7 @@ function toActivityDay(value: unknown): JiuwenMateActivityDay | null {
     tasks: count(row.tasks),
     ...(row.finished_tasks !== undefined ? { finishedTasks: count(row.finished_tasks) } : {}),
     ...(row.failures !== undefined ? { failures: count(row.failures) } : {}),
+    ...(row.replies !== undefined ? { replies: count(row.replies) } : {}),
     minutes: count(row.minutes),
     calls: count(row.calls),
     tokens: count(row.tokens),
@@ -1104,9 +1110,10 @@ export function createJiuwenMateApi(request: JiuwenMateRequest, subscribe?: Jiuw
     /** Removes the IM app; its agent keeps its data and returns if the same app is bound again. */
     async unbindConnection(connection: JiuwenMateConnection): Promise<void> {
       if (connection.channel === 'web') return;
+      const idKey = connection.channel === 'dingtalk' ? 'client_id' : 'app_id';
       await request(
         `channel.${connection.channel}.unbind_agent`,
-        connection.channel === 'dingtalk' ? { client_id: connection.connectionKey } : { app_id: connection.connectionKey },
+        { [idKey]: connection.connectionKey, persistent_agent_id: connection.agentId },
       );
     },
     async listModels(): Promise<JiuwenMateModelCatalog> {

@@ -1,6 +1,7 @@
+import { colleaguePortrait, customAvatarHue } from '../jiuwenmate/colleaguePortraits';
 import { Fragment, useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
-  AtSign, Bot, ChevronLeft, Folder, MessagesSquare, PencilLine, Plus, Search, Send, Settings, UserRound, X,
+  AtSign, Bot, ChevronLeft, Folder, MessagesSquare, PencilLine, Plus, Search, Send, Settings, UserMinus, UserRound, X,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { webClient, webRequest, type WsEvent } from '../../services/webClient';
@@ -16,15 +17,18 @@ import { Dialog } from '../../components/ui/Dialog/Dialog';
 import type { GroupDirectory } from './useGroupDirectory';
 import { FileDownloadList } from '../../components/ChatPanel/MessageItem';
 import { getFileIdentityKey } from '../../utils/fileDownloadDedup';
-import { groupChatClient, type GroupExecution, type GroupInfo, type GroupMessage, type GroupQuestion } from './client';
+import { groupChatClient, type GroupAutoReply, type GroupExecution, type GroupInfo, type GroupMember, type GroupMessage, type GroupQuestion } from './client';
+import { AutoReplySettings } from './AutoReplySettings';
 import { MemberPicker } from './MemberPicker';
 import { createAgentGroupManagementClient } from '../agentManagement/groupClient';
 import type { AgentGroupCatalogItem } from '../agentManagement/types';
 import { ExecutionCard } from './ExecutionCard';
+import { useWebUIPanels } from '../webui';
+import { webUIPluginPanelIcon } from '../webui/react/webuiPanelIcon';
 import { GroupFilePreviewPanel, GroupFileRow, groupFileTarget, type GroupFile } from './GroupFileRow';
 import { InteractionPrompt } from '../../components/InteractionSlot/InteractionPrompt';
 import '../../components/InteractionSlot/InteractionSlot.css';
-import { FINISHED_EXECUTIONS, filterGroupMembers, groupModelLocked, groupSessionSentIds, executionResult, groupTimeline, matchesMemberQuery, mentionExecutionPhase, pendingMentionReplies, type PendingMentionReply, renameAttachment, updateAttachments, isBackgroundRefreshTimeout, mergeExecutions, mergeMessages, selectedMentions } from './state';
+import { FINISHED_EXECUTIONS, autoReplyNotice, filterGroupMembers, groupModelLocked, groupSessionSentIds, executionResult, groupTimeline, matchesMemberQuery, memberHasActiveWork, mentionExecutionPhase, pendingMentionReplies, type PendingMentionReply, renameAttachment, updateAttachments, isBackgroundRefreshTimeout, mergeExecutions, mergeMessages, selectedMentions } from './state';
 import './groupChat.css';
 
 function Attachment({ file, onPreview }: { file: GroupFile; onPreview: (file: GroupFile) => void }) {
@@ -39,6 +43,8 @@ function Attachment({ file, onPreview }: { file: GroupFile; onPreview: (file: Gr
     }]} onPreview={() => onPreview(file)} />
   </div>;
 }
+
+type GroupPanel = 'members' | 'files' | `plugin:${string}`;
 
 /** One open group conversation with its member and file panels; the group list lives in the chat sidebar. */
 export function GroupChatWorkspace({ groupId, directory, onBack }: {
@@ -69,7 +75,16 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
   const [fileError, setFileError] = useState('');
   const [refreshError, setRefreshError] = useState('');
   const [addingMembers, setAddingMembers] = useState(false);
-  const [panel, setPanel] = useState<'members' | 'files' | null>('members');
+  const [removingMember, setRemovingMember] = useState<GroupMember | null>(null);
+  const [removeBusy, setRemoveBusy] = useState(false);
+  const [removeError, setRemoveError] = useState('');
+  const removeAttempt = useRef<{ memberName: string; token: string } | null>(null);
+  const [panel, setPanel] = useState<GroupPanel | null>('members');
+  // The group id is the session id, so plugins contribute through the regular right-panel slot.
+  const pluginPanels = useWebUIPanels({ slotId: 'conversation.panel.right', sessionId: group ? groupId : null });
+  const pluginPanel = panel?.startsWith('plugin:')
+    ? pluginPanels.panels.find((item) => `plugin:${item.panelId}` === panel) ?? null : null;
+  const sidePanel = panel?.startsWith('plugin:') && !pluginPanel ? null : panel;
   const [preview, setPreview] = useState<GroupFile | null>(null);
   const [panelWidth, setPanelWidth] = useState(400);
   const panelResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
@@ -126,6 +141,7 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
     return () => document.removeEventListener('pointerdown', close);
   }, [mentionMenu]);
   const [sending, setSending] = useState(false);
+  const [autoReplies, setAutoReplies] = useState<Record<string, GroupAutoReply>>({});
   const [modelReady, setModelReady] = useState(false);
   const [fileAction, setFileAction] = useState<{ kind: 'rename' | 'delete'; path: string; name: string } | null>(null);
   const [fileName, setFileName] = useState('');
@@ -220,6 +236,10 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
       historyTotal.current = head.total;
       setRefreshError('');
       setGroup(info);
+      // Every history page carries the whole decision map; the head page is the freshest read.
+      // A decision pushed while this request was in flight is newer than its pending snapshot.
+      setAutoReplies((current) => Object.fromEntries(Object.entries(head.auto_replies ?? {}).map(([id, item]) =>
+        [id, item.status === 'pending' && current[id] && current[id].status !== 'pending' ? current[id] : item])));
       setQuestions((info.pending_questions ?? []).filter((item) => !answeredQuestions.current.has(item.request_id)));
       setMessages((current) => mergeMessages(current, history));
       setExecutions((current) => mergeExecutions(current, snapshots));
@@ -250,7 +270,8 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
         void refresh();
         return;
       }
-      if (type === 'chat.ask_user_question' && payload.source === 'ask_user_interrupt') {
+      if (type === 'chat.ask_user_question'
+        && (payload.source === 'ask_user_interrupt' || payload.source === 'colleague_permission')) {
         const pending = payload as unknown as GroupQuestion;
         if (answeredQuestions.current.has(pending.request_id)) return;
         setQuestions((current) => [...current.filter((item) => item.request_id !== pending.request_id), pending]);
@@ -263,6 +284,14 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
       }
       if (['chat.error', 'team.error', 'team.interact.failed'].includes(String(type))) {
         report(payload.error || payload.message || t('groupChat.sendFailed'));
+        return;
+      }
+      if (type === 'group.auto_reply.updated') {
+        // The gateway forwards only the event identity, so the decision itself is read from the history head.
+        // This read is independent of refresh(), which skips while another refresh is in flight.
+        void groupChatClient.history(groupId, { limit: 1 }).then((head) => {
+          if (alive.current && head.auto_replies) setAutoReplies(head.auto_replies);
+        }).catch(() => undefined);
         return;
       }
       if (type === 'team.group_message.accepted') {
@@ -288,12 +317,13 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
         }
       } else if (payload.event_type === 'group.route.updated' || event.event === 'group.route.updated') {
         void refresh();
-      } else if (payload.event_type === 'group.member.added' || event.event === 'group.member.added') {
+      } else if (payload.event_type === 'group.member.added' || event.event === 'group.member.added'
+        || payload.event_type === 'group.member.removed' || event.event === 'group.member.removed') {
         void refresh();
       }
     };
-    const stops = ['group.route.updated', 'group.message', 'group.execution.created', 'group.execution.updated',
-      'chat.ask_user_question', 'chat.ask_user_answer', 'group.member.added', 'team.runtime_ready', 'team.group_message.accepted', 'chat.final', 'chat.error', 'team.error', 'team.interact.failed'].map((name) => webClient.on(name, onEvent));
+    const stops = ['group.route.updated', 'group.auto_reply.updated', 'group.message', 'group.execution.created', 'group.execution.updated',
+      'chat.ask_user_question', 'chat.ask_user_answer', 'group.member.added', 'group.member.removed', 'team.runtime_ready', 'team.group_message.accepted', 'chat.final', 'chat.error', 'team.error', 'team.interact.failed'].map((name) => webClient.on(name, onEvent));
     const stopState = webClient.onStateChange((state) => {
       setConnected(state === 'ready');
       if (state !== 'ready') return;
@@ -460,6 +490,7 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
       historyStart.current = null;
       setOlderOffset(0);
       sessionSentIds.clear();
+      setAutoReplies({});
       setMessages([]);
       setExecutions((current) => current.filter((item) => !FINISHED_EXECUTIONS.has(item.status)));
       setPreview(null);
@@ -467,6 +498,33 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
       await refresh();
     } catch (reason) { report(reason); }
     finally { if (alive.current) setClearing(false); }
+  }
+
+  async function confirmRemoveMember() {
+    if (!group || !removingMember || removeBusy) return;
+    setRemoveBusy(true);
+    setRemoveError('');
+    try {
+      const targetName = removingMember.member_name;
+      if (removeAttempt.current?.memberName !== targetName) {
+        removeAttempt.current = { memberName: targetName, token: crypto.randomUUID() };
+      }
+      await groupChatClient.removeMember(group.group_id, targetName, removeAttempt.current.token);
+      removeAttempt.current = null;
+      if (!alive.current) return;
+      setMentions((current) => current.filter((name) => name !== targetName));
+      setQuestions((current) => current.filter((item) => item.member_name !== targetName));
+      setRemovingMember(null);
+      const latest = await groupChatClient.get(group.group_id);
+      if (alive.current) setGroup(latest);
+      void useWorkspaceStore.getState().refreshWorkspaceData();
+      void directory.reload();
+      void refresh();
+    } catch (reason) {
+      if (alive.current) setRemoveError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (alive.current) setRemoveBusy(false);
+    }
   }
 
   const files = new Map<string, Record<string, unknown>>();
@@ -478,9 +536,21 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
   }
   const timeline = groupTimeline(messages, executions);
 
+  const historyMembers = group ? [...group.members, ...(group.former_members ?? [])] : [];
   const visibleMembers = filterGroupMembers(group?.members ?? [], memberQuery);
   const showSelf = matchesMemberQuery(t('groupChat.you'), memberQuery);
-  const memberAvatar = (member: string) => <TeamMemberAvatar member={member} className="group-chat-assignee-avatar" alt="" />;
+  const memberAvatar = (member: string) => {
+    const colleague = historyMembers.find((item) => item.member_name === member && item.kind === 'colleague');
+    if (colleague) {
+      const portrait = { id: colleague.id, name: colleague.display_name || member,
+        category: colleague.colleague_category || 'custom' as const, avatarUrl: colleague.avatar_url,
+        isDefault: colleague.is_default };
+      const hue = customAvatarHue(portrait);
+      return <img src={colleaguePortrait(portrait)} className="group-chat-assignee-avatar" alt=""
+        style={hue === null ? undefined : { filter: `hue-rotate(${hue}deg)` }} />;
+    }
+    return <TeamMemberAvatar member={member} className="group-chat-assignee-avatar" alt="" />;
+  };
   const agentCount = group?.members.length ?? 0;
 
   // 每条带 @ 的用户消息，各自记录尚未回音的被 @ 成员：
@@ -489,7 +559,7 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
   // 刷新后据服务端执行恢复；乐观 pending 阶段不弹。
   const modelLocked = groupModelLocked(messages, executions, olderOffset > 0);
   const pendingMentionsByMessage = group
-    ? pendingMentionReplies(messages, executions, group.members, sessionSentIds, group.organization_routes)
+    ? pendingMentionReplies(messages, executions, group.members, sessionSentIds, group.organization_routes, autoReplies)
     : new Map<string, PendingMentionReply[]>();
 
   return <section className="group-chat-workspace has-conversation" data-testid="group-chat-workspace">
@@ -509,6 +579,13 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
           <button type="button" className="group-chat-icon-button" aria-label={t('groupChat.files')} aria-pressed={!preview && panel === 'files'}
             title={t('groupChat.files')} onClick={() => { setPreview(null); setPanel(panel === 'files' && !preview ? null : 'files'); }}
             data-testid="group-chat-toggle-files"><Folder size={18} /></button>
+          {pluginPanels.panels.map((item) => {
+            const key: GroupPanel = `plugin:${item.panelId}`;
+            return <button type="button" className="group-chat-icon-button" key={item.key} aria-label={item.title}
+              aria-pressed={!preview && sidePanel === key} title={item.title}
+              onClick={() => { setPreview(null); setPanel(sidePanel === key && !preview ? null : key); }}
+              data-testid="group-chat-toggle-plugin" data-variant={item.panelId}>{webUIPluginPanelIcon(item)}</button>;
+          })}
           <button type="button" className="group-chat-icon-button" aria-label={t('groupChat.settings')} aria-pressed={!preview && panel === 'members'}
             title={t('groupChat.settings')} onClick={() => { setPreview(null); setPanel(panel === 'members' && !preview ? null : 'members'); }}
             data-testid="group-chat-toggle-members"><Settings size={18} /></button>
@@ -547,11 +624,16 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
                   <strong>{item.message.sender_name || item.message.sender}</strong>
                   <time dateTime={new Date(item.at).toISOString()}>{new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
                 </header>}
-                <GroupMessageContent message={item.message} animate={animatedMessages.current.has(item.id)} members={group.members} />
+                <GroupMessageContent message={item.message} animate={animatedMessages.current.has(item.id)} members={historyMembers} />
                 {item.message.pending && <small className="group-chat-muted" data-testid="group-chat-message-pending">
                   {t('groupChat.sending')}
                 </small>}
                 {(item.message.attachments ?? []).map((file, index) => <Attachment key={index} file={file} onPreview={setPreview} />)}
+                {item.message.sender === 'user' && autoReplies[item.id] && <small className="group-chat-muted group-chat-auto-reply"
+                  role="status" data-testid="group-chat-auto-reply" data-variant={autoReplies[item.id].status}>
+                  {((notice) => t(notice.key, notice.values))(
+                    autoReplyNotice(autoReplies[item.id], historyMembers, t('groupChat.autoReply.separator')))}
+                </small>}
               </article>
               {(pendingMentionsByMessage.get(item.id) ?? []).map(({ memberName, execution, organization, route }) => {
                 const member = group.members.find((item2) => item2.member_name === memberName);
@@ -626,6 +708,7 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
                 disabled={sending} onClick={() => mention(member.member_name)}
                 data-testid="group-chat-mention-option" data-variant={member.member_name}>
                 {memberAvatar(member.member_name)}<span>{member.display_name || member.member_name}</span>
+                {member.kind === 'colleague' && <small className="group-chat-tag" data-testid="group-chat-colleague-tag">{t('groupChat.colleague')}</small>}
                 {member.kind === 'agent_group' && <small className="group-chat-tag is-team">{t('groupChat.team')}</small>}
               </button>)}
             </div>}
@@ -648,7 +731,7 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
       </div>
     </div> : <div className="group-chat-empty" data-testid="group-chat-unavailable">{t('groupChat.unavailable')}</div>}
     </div>
-    {group && (preview || panel) && (
+    {group && (preview || sidePanel) && (
       <div
         className="resize-divider resize-divider--workspace touch-none select-none"
         role="separator"
@@ -663,10 +746,15 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
     {group && preview && <aside className="group-chat-panel is-preview" data-testid="group-chat-panel" data-variant="preview" style={{ width: panelWidth, flexShrink: 0 }}>
       <GroupFilePreviewPanel file={preview} onBack={() => setPreview(null)} />
     </aside>}
-    {group && panel && !preview && <aside className="group-chat-panel" data-testid="group-chat-panel" data-variant={panel} style={{ width: panelWidth, flexShrink: 0 }}>
+    {group && sidePanel && !preview && <aside className={`group-chat-panel${pluginPanel ? ' is-plugin' : ''}`} data-testid="group-chat-panel" data-variant={pluginPanel ? 'plugin' : sidePanel} style={{ width: panelWidth, flexShrink: 0 }}>
       <button type="button" className="group-chat-icon-button group-chat-panel-close" aria-label={t('common.close')}
         onClick={() => setPanel(null)} data-testid="group-chat-panel-close"><X size={18} /></button>
-      {panel === 'files' ? <>
+      {pluginPanel ? <>
+        <header><h2>{pluginPanel.title}</h2></header>
+        <div className="group-chat-plugin-body" data-testid="group-chat-plugin-body">
+          {pluginPanels.renderPanel(pluginPanel.key)}
+        </div>
+      </> : sidePanel === 'files' ? <>
         <header><h2>{t('groupChat.files')}</h2></header>
         <div className="group-chat-file-list" data-testid="group-chat-file-list">
           {!files.size && <p className="group-chat-muted" data-testid="group-chat-no-files">{t('groupChat.noFiles')}</p>}
@@ -719,20 +807,32 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
               description,
               `${t('groupChat.teamMembers', { count: expertNames.length })}\n${expertNames.join('\n')}`,
             ].filter(Boolean).join('\n\n') : description || t('groupChat.mention');
-            return <button type="button" className="group-chat-member-row" key={member.member_name}
-            disabled={sending} onClick={() => mention(member.member_name)} title={tooltip}
-            data-testid="group-chat-member" data-variant={member.member_name}>
-            <TeamMemberAvatar member={member.member_name} className="group-chat-member-avatar" alt="" />
-            <span>{member.display_name || member.member_name}</span>
-            {member.cli_agent && <small className="group-chat-provider" data-testid="group-chat-member-provider">
-              {member.cli_agent === 'claude' ? 'Claude Code' : 'Codex'}
-            </small>}
-            {member.kind === 'agent_group' && <small className="group-chat-tag is-team">{t('groupChat.team')}</small>}
-          </button>;
+            return <div className="group-chat-member-row is-removable" key={member.member_name}
+              data-testid="group-chat-member-item" data-variant={member.member_name}>
+              <button type="button" className="group-chat-member-main"
+                disabled={sending} onClick={() => mention(member.member_name)} title={tooltip}
+                data-testid="group-chat-member" data-variant={member.member_name}>
+                <TeamMemberAvatar member={member.member_name} className="group-chat-member-avatar" alt="" />
+                <span>{member.display_name || member.member_name}</span>
+                {member.cli_agent && <small className="group-chat-provider" data-testid="group-chat-member-provider">
+                  {member.cli_agent === 'claude' ? 'Claude Code' : 'Codex'}
+                </small>}
+                {member.kind === 'colleague' && <small className="group-chat-tag" data-testid="group-chat-colleague-tag">{t('groupChat.colleague')}</small>}
+                {member.kind === 'agent_group' && <small className="group-chat-tag is-team">{t('groupChat.team')}</small>}
+              </button>
+              <button type="button" className="group-chat-icon-button group-chat-member-remove"
+                disabled={!connected || removeBusy}
+                aria-label={t('groupChat.removeMember')} title={t('groupChat.removeMember')}
+                onClick={() => { setRemoveError(''); setRemovingMember(member); }}
+                data-testid="group-chat-remove-member" data-variant={member.member_name}>
+                <UserMinus size={15} />
+              </button>
+            </div>;
           })}
           {!showSelf && !visibleMembers.length && <p className="group-chat-muted" data-testid="group-chat-no-member-match">
             {t('groupChat.noMemberMatch')}</p>}
         </div>
+        <AutoReplySettings group={group} disabled={!connected} onSaved={setGroup} onError={report} />
         {/* 清空聊天记录 / 删除会话入口暂时不暴露；恢复时把下面的 JSX 注释解开即可。 */}
         {/* <footer className="group-chat-panel-footer">
           <button type="button" className="group-chat-outline-button" disabled={clearing}
@@ -772,6 +872,27 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
           onClick={() => setFileAction(null)} data-testid="group-chat-file-delete-cancel">{t('common.cancel')}</button>
           <button type="button" className="btn group-chat-delete" disabled={fileBusy} onClick={() => void submitFileAction()}
             data-testid="group-chat-file-delete-confirm">{t('groupChat.deleteShort')}</button></footer>
+      </div>
+    </Dialog>
+    <Dialog open={removingMember !== null} titleId="group-chat-member-remove-title" className="group-chat-small-dialog"
+      closeDisabled={removeBusy} onCancel={() => { setRemoveError(''); setRemovingMember(null); }}>
+      <div data-testid="group-chat-member-remove-dialog"><h2 id="group-chat-member-remove-title">{t('groupChat.removeMember')}</h2>
+        {removeError && <p role="alert" className="group-chat-error" data-testid="group-chat-member-remove-error">{removeError}</p>}
+        <p className="group-chat-delete-name" data-testid="group-chat-member-remove-name">
+          {removingMember?.display_name || removingMember?.member_name}
+        </p>
+        <p data-testid="group-chat-member-remove-warning">
+          {t(removingMember && memberHasActiveWork(removingMember.member_name, executions, group?.organization_routes)
+            ? 'groupChat.removeMemberActiveWarning'
+            : 'groupChat.removeMemberWarning')}
+        </p>
+        <footer className="group-chat-dialog-footer"><button type="button" className="btn" disabled={removeBusy}
+          onClick={() => { setRemoveError(''); setRemovingMember(null); }}
+          data-testid="group-chat-member-remove-cancel">{t('common.cancel')}</button>
+          <button type="button" className="btn group-chat-delete" disabled={removeBusy}
+            onClick={() => void confirmRemoveMember()} data-testid="group-chat-member-remove-confirm">
+            {t(removeBusy ? 'groupChat.removingMember' : 'groupChat.removeMemberConfirm')}
+          </button></footer>
       </div>
     </Dialog>
     <Dialog open={clearOpen} titleId="group-chat-clear-title" className="group-chat-small-dialog"

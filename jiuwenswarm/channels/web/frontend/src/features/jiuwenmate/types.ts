@@ -1,4 +1,4 @@
-export type JiuwenMateExistingPage = 'agents' | 'personalContext' | 'skills' | 'connectorMarket' | 'settings';
+export type JiuwenMateExistingPage = 'agents' | 'memory' | 'personalContext' | 'skills' | 'connectorMarket' | 'settings';
 
 export type JiuwenMateView =
   | 'office-intro'
@@ -169,6 +169,7 @@ export interface JiuwenMateActivityDay {
   tasks: number;
   finishedTasks?: number;
   failures?: number;
+  replies?: number;
   minutes: number;
   calls: number;
   tokens: number;

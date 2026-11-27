@@ -1,5 +1,6 @@
 import { createSettingsPageDefinition } from './createSettingsPageDefinition';
 import { openSourceSettingsAccessPolicy } from './accessPolicy';
+import { memoryModule } from '../modules/memory/definition';
 import { generalModule } from '../modules/general';
 import { modelsModule } from '../modules/models';
 import { agentModule } from '../modules/agent';
@@ -10,6 +11,7 @@ import { archivedTasksModule } from '../modules/archivedTasks';
 import { voiceModule } from '../modules/voice/definition';
 import { experimentalModule } from '../modules/experimental';
 import { appearanceModule } from '../modules/appearance';
+import { systemPluginRecoveryModule } from '../modules/systemPluginRecovery';
 
 export const openSourceSettingsPageDefinition = createSettingsPageDefinition({
   id: 'open-source-settings',
@@ -20,12 +22,14 @@ export const openSourceSettingsPageDefinition = createSettingsPageDefinition({
     modelsModule,
     voiceModule,
     agentModule,
+    memoryModule,
     browserModule,
     channelsModule,
     personalContextSettingsModule,
     archivedTasksModule,
     experimentalModule,
     appearanceModule,
+    systemPluginRecoveryModule,
   ],
 });
 

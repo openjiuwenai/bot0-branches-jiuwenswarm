@@ -13,6 +13,26 @@
 CONF=/etc/nginx/optional-upstreams/user-web-custom.conf
 : > "$CONF"
 
+# Each edition has exactly one listener on the existing Web service port.
+port=${WEB_HTTP_PORT:-5173}
+case "$port" in ''|*[!0-9]*) echo "Invalid WEB_HTTP_PORT" >&2; exit 1;; esac
+conf_dir=/etc/nginx/optional-upstreams
+: > "$conf_dir/user-web-redirect.inc" || exit 1
+if [ "${JIUWENSWARM_EDITION:-personal}" = enterprise ]; then
+    cat > "$conf_dir/user-web-listen.inc" <<EOF_LISTEN || exit 1
+listen $port ssl;
+http2 on;
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_certificate /etc/nginx/web-tls/tls.crt;
+ssl_certificate_key /etc/nginx/web-tls/tls.key;
+proxy_set_header X-Forwarded-Proto \$scheme;
+proxy_set_header X-Forwarded-Host \$http_host;
+EOF_LISTEN
+    echo 'absolute_redirect off;' > "$conf_dir/user-web-redirect.inc" || exit 1
+else
+    printf 'listen %s;\n' "$port" > "$conf_dir/user-web-listen.inc" || exit 1
+fi
+
 qualify_service_target() {
     # nginx's resolver does not apply the Pod's DNS search suffix.
     case "$1" in
@@ -40,9 +60,34 @@ if [ "${JIUWENSWARM_EDITION:-personal}" = "enterprise" ]; then
             if ($i ~ /^[^.]+\.svc\./) { print $i; exit }
         }
     }' /etc/resolv.conf)
+    backend_target=${USER_WEB_BACKEND_TARGET:-}
     if [ -n "$service_domain" ]; then
         idp_target=$(qualify_service_target "$idp_target")
         manager_target=$(qualify_service_target "$manager_target")
+        backend_target=$(qualify_service_target "$backend_target")
+    fi
+    if [ -n "$backend_target" ]; then
+        printf 'set $user_backend_target "%s";\n' "${backend_target%/}" >> "$CONF"
+        cat >> "$CONF" <<'EOF_BACKEND'
+location ^~ /idp/ {
+    proxy_pass $user_backend_target;
+}
+location ^~ /manager-api/v1/user-console/ {
+    rewrite ^/manager-api/(.*)$ /api/$1 break;
+    proxy_pass $user_backend_target;
+}
+location = /manager-api { return 404; }
+location ^~ /manager-api/ { return 404; }
+location = /file-api { return 307 /file-api/; }
+location = /share-api { return 307 /share-api/; }
+EOF_BACKEND
+        for file in user-http.inc user-webchannel-http.inc user-ws.inc; do
+            printf 'proxy_pass $user_backend_target;\n' > "/etc/nginx/optional-upstreams/$file"
+        done
+        # The WebSocket locations set Upgrade locally and do not inherit server headers.
+        printf '%s\n' 'proxy_set_header X-Forwarded-Proto $scheme;' \
+            'proxy_set_header X-Forwarded-Host $http_host;' >> /etc/nginx/optional-upstreams/user-ws.inc
+        exit 0
     fi
     cat >> "$CONF" <<EOF_TARGETS
 set \$user_idp_target "${idp_target%/}";

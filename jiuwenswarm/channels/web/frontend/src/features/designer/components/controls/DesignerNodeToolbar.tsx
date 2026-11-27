@@ -1,10 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useReactFlow } from '@xyflow/react';
 import SendPlaneIcon from '../../../../assets/send_plane.svg?react';
 import { isComfyuiNodeConfig } from '../../comfyuiWorkflow';
+import { nodeSendBlockedByMissingModel } from '../../designerNodeGenerationKind';
+import {
+  clipSceneReferenceWarning,
+  type DesignerSceneBindingNode,
+} from '../../designerSceneBinding';
 import { designerToolbarRevealShift } from '../../designerToolbarVisibility';
 import { useDesignerGraphEditingLocked } from '../../useDesignerGraphEditingLocked';
+import { useDesignerModelConfiguration } from '../../useDesignerModelConfiguration';
 import { useDesignerRunStore } from '../../designerRunStore';
 import { useDesignerStore } from '../../designerStore';
 import {
@@ -36,6 +42,7 @@ export function DesignerNodeToolbar({ nodeId, nodeType }: DesignerNodeToolbarPro
   const isRunning = useDesignerRunStore((state) => state.isRunning);
   const editingLocked = useDesignerGraphEditingLocked();
   const domainGraph = useDesignerStore((state) => state.domainGraph);
+  const generation = useDesignerModelConfiguration();
   const config = useDesignerStore(
     (state) => state.domainGraph?.nodes.find((node) => node.id === nodeId)?.config ?? {},
   );
@@ -49,6 +56,12 @@ export function DesignerNodeToolbar({ nodeId, nodeType }: DesignerNodeToolbarPro
   const promptFocusedRef = useRef(false);
   const storePrompt = media.generate?.prompt ?? '';
   const [promptDraft, setPromptDraft] = useState(storePrompt);
+
+  const sceneWarning = useMemo(() => {
+    const nodes = (domainGraph?.nodes ?? []) as unknown as DesignerSceneBindingNode[];
+    const node = nodes.find((item) => item.id === nodeId);
+    return node ? clipSceneReferenceWarning(nodes, node) : null;
+  }, [domainGraph, nodeId]);
 
   useEffect(() => {
     promptFocusedRef.current = false;
@@ -87,10 +100,18 @@ export function DesignerNodeToolbar({ nodeId, nodeType }: DesignerNodeToolbarPro
     [editingLocked, nodeId, updateNodeConfig],
   );
 
+  const currentNode = domainGraph?.nodes.find((item) => item.id === nodeId);
+  const generationKind = currentNode?.type === 'image' || currentNode?.type === 'video' ? currentNode.type : null;
+  const sendBlocked = nodeSendBlockedByMissingModel(
+    currentNode,
+    domainGraph,
+    generation.snapshot ? generation.selection : null,
+  );
+
   const onGenerateNode = useCallback(() => {
-    if (!domainGraph || isRunning || editingLocked) return;
+    if (!domainGraph || isRunning || editingLocked || sendBlocked) return;
     void rerunNode(domainGraph, nodeId);
-  }, [domainGraph, editingLocked, isRunning, nodeId, rerunNode]);
+  }, [domainGraph, editingLocked, isRunning, nodeId, rerunNode, sendBlocked]);
 
   if (isMedia && !canGenerate) {
     return null;
@@ -122,6 +143,15 @@ export function DesignerNodeToolbar({ nodeId, nodeType }: DesignerNodeToolbarPro
           <p className="designer-node-toolbar__prompt-hint" data-testid="designer-node-toolbar-prompt-hint">
             {comfyui ? t('designer.comfyui.promptHint') : t('designer.toolbar.promptHint')}
           </p>
+          {sceneWarning ? (
+            <p
+              className="designer-node-toolbar__scene-warning"
+              data-testid="designer-node-toolbar-scene-warning"
+              data-variant={sceneWarning.kind}
+            >
+              {t('designer.toolbar.sceneReferenceMissing')}
+            </p>
+          ) : null}
           {comfyui ? <DesignerComfyuiParamsForm nodeId={nodeId} comfyui={comfyui} /> : null}
           <div className="designer-node-toolbar__composer">
             <textarea
@@ -158,8 +188,12 @@ export function DesignerNodeToolbar({ nodeId, nodeType }: DesignerNodeToolbarPro
                 type="button"
                 className={`designer-node-toolbar__send${editingLocked ? ' designer-edit-control' : ''}`}
                 data-testid="designer-node-toolbar-generate-action"
-                disabled={isRunning || !domainGraph || editingLocked}
-                title={t('designer.toolbar.rerunHint')}
+                disabled={isRunning || !domainGraph || editingLocked || sendBlocked}
+                title={
+                  sendBlocked && generationKind
+                    ? t(`designer.models.${generationKind}Missing`)
+                    : t('designer.toolbar.rerunHint')
+                }
                 aria-label={t('designer.toolbar.generateAction')}
                 onClick={onGenerateNode}
               >

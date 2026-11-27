@@ -146,6 +146,10 @@ from jiuwenswarm.server.runtime.debug_trace.directives import (
 )
 _FOLLOWUP_INTERACT_BOUNDARY_TIMEOUT_SEC = 10.0
 _FOLLOWUP_INTERACT_POLL_INTERVAL_SEC = 0.05
+# Worst observed teardown (14 members stopping) runs ~30 s inside Runner.pause
+# plus the stream exit and drain; input waiting on a teardown gets this
+# budget instead of the 10 s interact-retry deadline.
+_TEAM_TEARDOWN_WAIT_TIMEOUT_SEC = 60.0
 _TEAM_HEARTBEAT_SERVICE: ContextVar[Any | None] = ContextVar(
     "team_heartbeat_service",
     default=None,
@@ -471,6 +475,15 @@ def _team_hide_teammate_enabled() -> bool:
     """Return whether non-leader teammate frames should be filtered out in team mode."""
     return os.environ.get(_HIDE_TEAMMATE_ENV_KEY, "").strip().lower() == "true"
 
+
+def _is_teammate_permission_card(parsed: dict[str, Any] | None) -> bool:
+    """Return whether a parsed frame is a user-visible teammate permission card."""
+    return (
+        isinstance(parsed, dict)
+        and parsed.get("event_type") == "chat.ask_user_question"
+        and parsed.get("source") == "permission_interrupt"
+    )
+
 _INTERACT_REASON_ERROR_MAP: dict[str, str] = {
     "not_active": "Team is initializing, please try again later",
     "session_mismatch": "Session state mismatch, please refresh and retry",
@@ -762,6 +775,47 @@ def _pop_team_stream_task(
     team_manager.pop_stream_task(session_id, generation=generation)
 
 
+def _team_round_is_draining(team_manager: Any, session_id: str) -> bool:
+    """Whether an owned teardown window holds new team input.
+
+    Core closes the interact gate only after the runner finished finalize,
+    while Swarm-side markers survive until the producer's own finally exits,
+    so during that window a follow-up is admitted by the still-open gate and
+    then fails against the stopped leader. Only teardowns with an explicit
+    owner hold the admission barrier: a pause request for its whole
+    processing, the cron round handoff in finish_cron_stream, and a fenced
+    stop in stop_session_runtime. The stream/round shape is deliberately NOT
+    consulted: a persistent stream parks released rounds between messages by
+    design (team.idle keeps the stream open for the next message to wake),
+    so waiting on that shape would deadlock a stream that is waiting for
+    this very message.
+    """
+    is_stop_pending = getattr(team_manager, "is_request_stop_pending", None)
+    wait_for_stop = getattr(team_manager, "wait_for_request_stop", None)
+    if not (callable(is_stop_pending) and callable(wait_for_stop)):
+        # Managers without the admission hold mechanism degrade to the
+        # legacy direct delivery attempts.
+        return False
+    return bool(is_stop_pending(session_id))
+
+
+async def _await_team_round_teardown(
+    team_manager: Any,
+    session_id: str,
+    *,
+    timeout_sec: float,
+) -> bool:
+    """Wait for a draining round's teardown. False when the budget ran out."""
+    wait_for_stop = getattr(team_manager, "wait_for_request_stop", None)
+    if not callable(wait_for_stop):
+        return True
+    try:
+        await asyncio.wait_for(wait_for_stop(session_id), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
 async def _deliver_followup_interact_across_boundary(
     team_manager: Any,
     session_id: str,
@@ -776,12 +830,34 @@ async def _deliver_followup_interact_across_boundary(
     deadline = time.monotonic() + max(0.0, timeout_sec)
     sleep_sec = max(0.01, poll_interval_sec)
     last_reason = initial_reason
-    while time.monotonic() < deadline:
+    while True:
+        # Check the teardown hold BEFORE runtime presence: a pause clears the
+        # runtime markers while its drain and terminal push still run, so a
+        # presence check that runs first would reclassify the message and
+        # start a new round inside the pause tail.
+        if _team_round_is_draining(team_manager, session_id):
+            # The old round's producer is exiting and its leader can no longer
+            # accept input: stop delivering and wait for the teardown, then
+            # hand the message to the resume or new-round path.
+            drained = await _await_team_round_teardown(
+                team_manager,
+                session_id,
+                timeout_sec=_TEAM_TEARDOWN_WAIT_TIMEOUT_SEC,
+            )
+            if not drained:
+                return _FollowupInteractBoundaryResult(
+                    success=False,
+                    reason=last_reason or "gate_closed",
+                    first_request_ready=False,
+                )
+            # The teardown consumed real wall time, so the interact retries
+            # get a fresh budget instead of a deadline the wait already spent.
+            deadline = time.monotonic() + max(0.0, timeout_sec)
+            continue
         if not await _team_session_has_runtime(team_manager, session_id):
             return _FollowupInteractBoundaryResult(success=False, reason=last_reason, first_request_ready=True)
-        await asyncio.sleep(sleep_sec)
-        if not await _team_session_has_runtime(team_manager, session_id):
-            return _FollowupInteractBoundaryResult(success=False, reason=last_reason, first_request_ready=True)
+        if time.monotonic() >= deadline:
+            break
         success, reason = await _interact_with_team_context(
             team_manager,
             session_id,
@@ -793,6 +869,7 @@ async def _deliver_followup_interact_across_boundary(
         last_reason = reason
         if not _is_followup_delivery_boundary_reason(reason):
             return _FollowupInteractBoundaryResult(success=False, reason=reason, first_request_ready=False)
+        await asyncio.sleep(sleep_sec)
     first_request_ready = not await _team_session_has_runtime(team_manager, session_id)
     return _FollowupInteractBoundaryResult(
         success=False,
@@ -1357,25 +1434,56 @@ def _resolve_session_team_bootstrap_mode(
     return _coerce_team_bootstrap_mode(metadata.get(_SESSION_TEAM_BOOTSTRAP_MODE_KEY))
 
 
+def _framework_bootstrap_will_build(session_id: str) -> bool:
+    """True when a framework bootstrap is about to materialize the Team.
+
+    ``kernel.start()`` builds only while the session has no Team row, and the
+    row's ``team_name`` reaches session metadata at ``runtime_ready``. Using
+    that fact instead of ``is_first_request`` also covers later requests,
+    follow-up fallbacks and cold starts, where the first-request flag is gone
+    but the roster would still be materialized.
+    """
+    try:
+        from jiuwenswarm.server.runtime.session.session_metadata import _read_metadata
+
+        metadata = _read_metadata(session_id, cache_bust=True) or {}
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[TeamHelpers] framework build metadata read failed: session_id=%s",
+            session_id,
+            exc_info=True,
+        )
+        return True
+    return not str(metadata.get("team_name") or "").strip()
+
+
 def _resolve_channel_id(channel_id: str | None) -> str:
     return str(channel_id or "default").strip() or "default"
 
 
 def _resolve_request_language(request: Any) -> str:
+    from jiuwenswarm.common.i18n import try_normalize_preferred_language
+    from jiuwenswarm.enterprise.config.preferred_language import (
+        resolve_preferred_language,
+    )
+
     metadata = getattr(request, "metadata", None)
     params = getattr(request, "params", None)
     sources = []
-    if isinstance(metadata, dict):
-        sources.append(metadata)
     if isinstance(params, dict):
         sources.append(params)
+    if isinstance(metadata, dict):
+        sources.append(metadata)
 
+    # UI language only — never treat preferred_response_language=match as UI.
     for source in sources:
-        for key in ("language", "preferred_language", "preferred_response_language"):
+        for key in ("ui_language", "language", "preferred_language"):
             value = source.get(key)
             if value:
-                return str(value).strip().lower() or "zh"
-    return "zh"
+                mapped = try_normalize_preferred_language(value)
+                if mapped is not None:
+                    return mapped
+    return resolve_preferred_language()
 
 
 def _safe_query_preview(query: Any, limit: int = DEFAULT_PREVIEW_MAX_CHARS) -> str:
@@ -1640,6 +1748,17 @@ def _group_chat_input(request: Any, text: Any) -> dict | None:
     if any(not isinstance(item, dict) for item in attachments):
         raise ValueError("Group attachments must contain JSON objects")
     return payload
+
+
+def _schedule_group_auto_reply(session_id: str, group_input: dict) -> None:
+    """Hand an accepted, unmentioned user message to the group's judge model."""
+    try:
+        from jiuwenswarm.server.runtime.group_auto_reply import schedule
+
+        schedule(session_id, str(group_input["client_message_id"]))
+    except Exception:
+        # The message is already archived; a failed judgement must not fail its acceptance.
+        logger.warning("[TeamHelpers] group auto reply was not scheduled session_id=%s", session_id, exc_info=True)
 
 
 async def _record_group_organization_plan(session_id: str, group_input: dict) -> str | None:
@@ -2740,15 +2859,22 @@ async def _apply_enterprise_runtime_ready_hooks(
     """Attach the teammate quota guard and back-fill team identity on ready."""
     from jiuwenswarm.infrastructure.db.team_store_actor import run_team_store
 
+    team_agent = await _current_pool_team_agent(runtime_team_name)
+    backend = getattr(team_agent, "team_backend", None)
+    if getattr(backend, "conversation_mode", None) == "group_chat":
+        from jiuwenswarm.enterprise.team.member_limits import detach_teammate_limit_guard
+
+        detach_teammate_limit_guard(team_agent)
+        return
+
     await run_team_store(
         _record_session_team_occupancy,
         request=request,
         session_id=session_id,
         runtime_team_name=runtime_team_name,
     )
-    team_agent = await _current_pool_team_agent(runtime_team_name)
     try:
-        from jiuwenswarm.enterprise.team.member_limits import attach_teammate_limit_guard
+        from jiuwenswarm.enterprise.team.member_limits import attach_teammate_limit_guard, quota_member_names
 
         if team_agent is not None:
             team_id = ""
@@ -2766,14 +2892,118 @@ async def _apply_enterprise_runtime_ready_hooks(
                     owner = entity.owner
             except Exception:  # noqa: BLE001
                 team_id = ""
+            max_teammates = 0
+            from jiuwenswarm.enterprise.edition import is_enterprise
+            from jiuwenswarm.enterprise.config.preferred_language import (
+                resolve_preferred_language,
+            )
+
+            # Capture while still under request bind; deferred exceed callbacks
+            # may run after memo reset and would otherwise fall back to yaml.
+            notice_language = resolve_preferred_language()
+
+            # Personal edition keeps its historical guard behavior. The owner
+            # fallback and platform member cap are enterprise-only.
+            if is_enterprise():
+                try:
+                    from jiuwenswarm.enterprise.team.control_store import OwnerIdentity
+                    from jiuwenswarm.enterprise.team.handlers import request_identity
+                    from jiuwenswarm.enterprise.team.quota import get_team_quota_service
+
+                    if owner is None and request is not None:
+                        candidate = request_identity(request)
+                        if str(getattr(candidate, "user_id", "") or "").strip():
+                            owner = candidate
+                    # Routed/restored sessions may have no request contextvar or
+                    # control entity at runtime_ready. Fall back to the session
+                    # metadata identity so the member cap is still resolved
+                    # instead of silently skipping the guard.
+                    if owner is None or not str(getattr(owner, "user_id", "") or "").strip():
+                        metadata = get_session_metadata(session_id) or {}
+                        channel_metadata = metadata.get("channel_metadata") or {}
+                        routing = (
+                            channel_metadata.get("routing")
+                            if isinstance(channel_metadata, dict)
+                            else {}
+                        ) or {}
+                        candidate = OwnerIdentity(
+                            user_id=str(metadata.get("user_id") or "").strip(),
+                            group_id=str(routing.get("group_id") or "").strip(),
+                            bot_id=str(routing.get("bot_id") or "").strip(),
+                        )
+                        if candidate.user_id:
+                            owner = candidate
+                    if owner is not None and str(getattr(owner, "user_id", "") or "").strip():
+                        limits = await run_team_store(
+                            get_team_quota_service().resolve_limits,
+                            owner,
+                        )
+                        max_teammates = int(limits.max_teammates_per_team)
+                except Exception:  # noqa: BLE001
+                    logger.debug("[TeamHelpers] teammate limit resolve failed", exc_info=True)
+                if max_teammates <= 0:
+                    # Enterprise quota always has a platform default. If the
+                    # owner is unresolved (and the team has no control entity),
+                    # leaving max_teammates=0 would skip the guard entirely and
+                    # let a bulk AgentGroup/Skill roster exceed the cap. Fail
+                    # closed only while the quota feature itself is enabled.
+                    from jiuwenswarm.enterprise.team.member_limits import (
+                        DEFAULT_MAX_TEAMMATES,
+                    )
+                    from jiuwenswarm.enterprise.team.quota import team_quota_enabled
+
+                    if team_quota_enabled():
+                        max_teammates = DEFAULT_MAX_TEAMMATES
+                        logger.warning(
+                            "[TeamHelpers] member cap unresolved; using default=%s "
+                            "session_id=%s team_name=%s",
+                            max_teammates,
+                            session_id,
+                            runtime_team_name,
+                        )
             attach_teammate_limit_guard(
                 team_agent,
+                max_teammates=max_teammates,
                 team_id=team_id,
                 owner=owner,
                 on_quota_exceeded=lambda **kwargs: _emit_teammate_quota_notice(
-                    channel_id, session_id, **kwargs
+                    channel_id,
+                    session_id,
+                    language=notice_language,
+                    **kwargs,
                 ),
             )
+            # Swarmflow workers are created outside TeamBackend.spawn_member,
+            # so register the same whole-team cap for that execution path too.
+            # Design canvas nodes are a separate execution surface, not the
+            # user-facing team roster, so leave team.design alone.
+            mode = ""
+            params = getattr(request, "params", None) if request is not None else None
+            if isinstance(params, dict):
+                mode = str(params.get("mode") or "").strip()
+            if not mode:
+                try:
+                    mode = str(get_session_metadata(session_id).get("mode") or "").strip()
+                except Exception:  # noqa: BLE001
+                    mode = ""
+            if is_enterprise() and max_teammates > 0 and mode != NEW_TEAM_DESIGN:
+                from jiuwenswarm.enterprise.team.member_limits import (
+                    install_swarmflow_worker_quota_guard,
+                    register_swarmflow_worker_quota,
+                )
+
+                register_swarmflow_worker_quota(
+                    session_id=session_id,
+                    team_name=runtime_team_name,
+                    max_teammates=max_teammates,
+                    on_quota_exceeded=lambda **kwargs: _emit_teammate_quota_notice(
+                        channel_id,
+                        session_id,
+                        language=notice_language,
+                        **kwargs,
+                    ),
+                )
+                install_swarmflow_worker_quota_guard()
             if team_id:
                 try:
                     from jiuwenswarm.infrastructure.db.team_store_actor import run_team_store
@@ -2783,12 +3013,7 @@ async def _apply_enterprise_runtime_ready_hooks(
                     leader_name = str(getattr(backend, "leader_member_name", "") or "")
                     names: list[str] = []
                     if backend is not None and getattr(backend, "db", None) is not None:
-                        roster = await backend.db.member.get_member_roster(backend.team_name)
-                        names = [
-                            str(name)
-                            for name, _display, _status in roster
-                            if str(name) and str(name) != leader_name
-                        ]
+                        names = [name for name in await quota_member_names(backend) if name != leader_name]
                     await run_team_store(
                         get_team_quota_service().reconcile_local_roster,
                         team_id,
@@ -2796,6 +3021,13 @@ async def _apply_enterprise_runtime_ready_hooks(
                     )
                 except Exception:  # noqa: BLE001
                     logger.debug("[TeamHelpers] teammate quota roster reconcile failed", exc_info=True)
+        else:
+            logger.warning(
+                "[TeamHelpers] teammate quota guard not attached: no pooled leader agent "
+                "session_id=%s team_name=%s",
+                session_id,
+                runtime_team_name,
+            )
     except Exception:  # noqa: BLE001
         logger.debug("[TeamHelpers] teammate limit guard attach failed", exc_info=True)
 
@@ -2841,6 +3073,7 @@ def _emit_teammate_quota_notice(
     used: int,
     limit: int,
     member_name: str = "",
+    language: str | None = None,
     **_kwargs: Any,
 ) -> None:
     """Show one user-facing teammate-quota notice per round."""
@@ -2850,7 +3083,7 @@ def _emit_teammate_quota_notice(
     claim = getattr(tm, "claim_teammate_quota_notice", None)
     if callable(claim) and not claim(session_id):
         return
-    content = teammate_quota_user_message(limit)
+    content = teammate_quota_user_message(limit, language=language)
     event = {
         "event_type": "chat.notice",
         "notice_type": "team_teammate_quota",
@@ -2921,14 +3154,13 @@ def _redact_teammate_quota_tool_result(parsed: dict[str, Any]) -> dict[str, Any]
         return parsed
     keys = ("result", "raw_output", "summary", "content", "error", "rendered_result")
     blob = "\n".join(str(parsed.get(key) or "") for key in keys)
-    if "TEAM_MEMBER_QUOTA_EXCEEDED" not in blob and "人数已满" not in blob:
+    markers = ("TEAM_MEMBER_QUOTA_EXCEEDED", "人数已满", "Team is full")
+    if not any(marker in blob for marker in markers):
         return parsed
     redacted = dict(parsed)
     for key in keys:
         value = redacted.get(key)
-        if isinstance(value, str) and (
-            "TEAM_MEMBER_QUOTA_EXCEEDED" in value or "人数已满" in value
-        ):
+        if isinstance(value, str) and any(marker in value for marker in markers):
             redacted[key] = "TEAM_MEMBER_QUOTA_EXCEEDED"
     return redacted
 
@@ -2992,7 +3224,14 @@ def _is_duplicate_ask_user_question(
     parsed: dict[str, Any],
     emitted_request_ids: set[str],
 ) -> bool:
+    """Drop an immediate replay of the same ask.
+
+    Any other frame ends that burst. A permission card kept waiting after a
+    sibling runs is written again with the original tool_call_id, and that
+    refresh has to reach the client.
+    """
     if parsed.get("event_type") != "chat.ask_user_question":
+        emitted_request_ids.clear()
         return False
     request_id = str(parsed.get("request_id") or "").strip()
     if not request_id:
@@ -3559,11 +3798,16 @@ async def _process_team_message_stream_with_design(
     the standard team pipeline.
     """
     design_bindings = await _bind_design_round_if_needed(request)
+    npc_team = (getattr(request, "trusted_runtime_binding", None) or {}).get("app_role_team") is True
     try:
         async with aclosing(_process_team_message_stream_locked(
             request, inputs, deep_agent
         )) as stream:
             async for chunk in stream:
+                if npc_team and chunk.payload and chunk.payload.get("event_type") not in {
+                    "chat.final", "chat.error", "chat.processing_status", "chat.input_received",
+                }:
+                    continue
                 if design_bindings is not None:
                     _push_design_tool_activity(request, chunk)
                 if isinstance(chunk.payload, dict) and chunk.payload.get("event_type") == "chat.processing_status":
@@ -3677,7 +3921,35 @@ async def _process_team_message_stream_locked(
     if callable(wait_for_stop):
         # Wait before marking this input in-flight: the old producer's cleanup
         # must finish before the new turn chooses or activates a runtime.
-        await wait_for_stop(session_id)
+        # Delivering to a leader whose round is winding down (explicit pause
+        # or natural finalize) can only fail against a stopped harness.
+        try:
+            await asyncio.wait_for(
+                wait_for_stop(session_id),
+                timeout=_TEAM_TEARDOWN_WAIT_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[TeamHelpers] team teardown wait timed out: session_id=%s timeout=%s",
+                session_id,
+                _TEAM_TEARDOWN_WAIT_TIMEOUT_SEC,
+            )
+            yield AgentResponseChunk(
+                request_id=request_id,
+                channel_id=request.channel_id,
+                payload={
+                    "event_type": "chat.error",
+                    "error": "Team is finishing a previous round, please try again in a moment",
+                },
+                is_complete=False,
+            )
+            yield AgentResponseChunk(
+                request_id=request_id,
+                channel_id=request.channel_id,
+                payload=None,
+                is_complete=True,
+            )
+            return
     # 归档闸门：Team 回合从进入适配器起即算「运行中」，直到本轮 round 终止
     # （round 之前的 spec 组装 / 运行时激活等准备阶段也要覆盖）。
     begin_request = getattr(team_manager, "begin_request", None)
@@ -3691,6 +3963,34 @@ async def _process_team_message_stream_locked(
         startup_lock = team_manager.get_startup_lock(session_id)
         async with AsyncExitStack() as startup:
             await startup.enter_async_context(startup_lock)
+            # The entry wait above can complete while this task was queued on
+            # the startup lock: a pause or a completed-stream teardown may
+            # have started meanwhile. Recheck under the lock and wait the
+            # gate out before choosing or activating a runtime; hold owners
+            # never take this lock, so waiting here cannot deadlock.
+            if _team_round_is_draining(team_manager, session_id):
+                drained = await _await_team_round_teardown(
+                    team_manager,
+                    session_id,
+                    timeout_sec=_TEAM_TEARDOWN_WAIT_TIMEOUT_SEC,
+                )
+                if not drained:
+                    yield AgentResponseChunk(
+                        request_id=request_id,
+                        channel_id=request.channel_id,
+                        payload={
+                            "event_type": "chat.error",
+                            "error": "Team is finishing a previous round, please try again in a moment",
+                        },
+                        is_complete=False,
+                    )
+                    yield AgentResponseChunk(
+                        request_id=request_id,
+                        channel_id=request.channel_id,
+                        payload=None,
+                        is_complete=True,
+                    )
+                    return
             params = request.params if isinstance(request.params, dict) else {}
             if params.get("intent") == "task":
                 from jiuwenswarm.server.runtime.group_service import GroupService, read_group
@@ -3778,6 +4078,12 @@ async def _process_team_message_stream(
     )
     has_execution_context = isinstance(execution_context, TeamExecutionContext)
     run_context = _team_input_run_context(request) if has_execution_context else None
+    from jiuwenswarm.agents.harness.common.rails.permissions.root_context import extract_permission_user_content
+    from jiuwenswarm.common.team_memory_binding import team_memory_user_context
+
+    human_text = extract_permission_user_content(inputs.get("query"))
+    if human_text:
+        run_context = team_memory_user_context(run_context, human_text)
 
     # Attach-only subscription: entering a running Team Session observes the
     # live stream without submitting input. It must short-circuit before the
@@ -3816,8 +4122,17 @@ async def _process_team_message_stream(
     turn = _resolve_user_turn(inputs, channel_id=channel_id, language=language)
     query = turn.text
     private_group_heartbeat = _is_group_heartbeat_request(request)
+    npc_team = (getattr(request, "trusted_runtime_binding", None) or {}).get("app_role_team") is True
     try:
-        group_input = None if private_group_heartbeat else _group_chat_input(request, query)
+        if npc_team:
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("NPC Team requires a non-empty player message")
+            if (request_params or {}).get("type") == "group_chat":
+                raise ValueError("NPC Team accepts player input only through its leader")
+            # A literal prefix keeps @/$/# routing and slash commands out of player text.
+            query = f"Player input:\n{query}"
+            turn = turn.with_text(query)
+        group_input = None if (private_group_heartbeat or npc_team) else _group_chat_input(request, query)
     except ValueError as exc:
         yield AgentResponseChunk(
             request_id=rid, channel_id=channel_id,
@@ -4089,10 +4404,10 @@ async def _process_team_message_stream(
             hide_dm = preparation.hide_dm
             debug = preparation.debug
 
-    if is_first_request:
+    if is_first_request and group_input is None:
         from jiuwenswarm.enterprise.edition import is_enterprise
 
-        # 超员拒绝只属于企业版。个人版不解析人数，也不为取上限打开配额服务。
+        # Team execution quotas do not limit the public group roster.
         if is_enterprise():
             from jiuwenswarm.enterprise.team.quota import QUOTA_EXCEEDED
 
@@ -4190,7 +4505,8 @@ async def _process_team_message_stream(
         #   - 消息中无 @ → $member_name body（不自动拼接 @team_leader，
         #     HumanAgent 可直接与自己扮演的 agent 对话，如 $reviewer-1 看一下当前有哪些任务）
         member_name = str(request_metadata.get("member_name") or "").strip()
-        if member_name and query_text and not query_text.startswith("$"):
+        direct_member_message = bool(member_name and query_text and not query_text.startswith("$"))
+        if not npc_team and direct_member_message:
             query = f"${member_name} {query_text}"
             query_text = query if isinstance(query, str) else str(query)
             logger.info(
@@ -4382,6 +4698,88 @@ async def _process_team_message_stream(
             model_selection=runtime_model_selection,
             config_base=team_runtime_config,
         )
+        if (
+            str(getattr(team_spec, "bootstrap_mode", "")) == "framework"
+            and _framework_bootstrap_will_build(session_id)
+        ):
+            from jiuwenswarm.enterprise.edition import is_enterprise
+            from jiuwenswarm.enterprise.team.member_limits import (
+                count_predefined_quota_members,
+                predefined_team_size_user_message,
+                whole_team_member_limit,
+            )
+            from jiuwenswarm.enterprise.team.quota import (
+                QUOTA_EXCEEDED,
+            )
+
+            # A framework bootstrap materializes the whole predefined roster
+            # inside kernel.start(), before team.runtime_ready attaches the
+            # teammate guard. Refuse an oversized AgentGroup/Skill roster here
+            # instead of letting it slip past the per-spawn admission.
+            if is_enterprise():
+                predefined = list(getattr(team_spec, "predefined_members", []) or [])
+                team_size = count_predefined_quota_members(predefined) + 1
+                limit, default = whole_team_member_limit(request, team_runtime_config)
+                if limit > 0 and team_size > limit:
+                    content = predefined_team_size_user_message(team_size, limit)
+                    event = {
+                        "event_type": "chat.notice",
+                        "notice_type": "team_predefined_size",
+                        "session_id": session_id,
+                        "content": content,
+                        "message": content,
+                        "code": QUOTA_EXCEEDED,
+                        "quota": {
+                            "kind": "teammate_spawn",
+                            "used": team_size,
+                            "limit": limit,
+                            "default": default,
+                        },
+                    }
+                    _persist_team_notice(
+                        channel_id,
+                        session_id,
+                        request_id=f"team-predefined-size-{rid}",
+                        content=content,
+                        event=event,
+                    )
+                    yield AgentResponseChunk(
+                        request_id=rid,
+                        channel_id=channel_id,
+                        payload=event,
+                        is_complete=False,
+                    )
+                    yield AgentResponseChunk(
+                        request_id=rid,
+                        channel_id=channel_id,
+                        payload={"event_type": "chat.done"},
+                        is_complete=False,
+                    )
+                    yield AgentResponseChunk(
+                        request_id=rid,
+                        channel_id=channel_id,
+                        payload=None,
+                        is_complete=True,
+                    )
+                    await _release_team_create_off_loop(enterprise_create_lease)
+                    return
+        from jiuwenswarm.server.runtime.session.execution_settings import prepare_session_execution
+
+        try:
+            await prepare_session_execution(
+                session_id,
+                team_spec,
+                params_obj.get("execution_settings") if isinstance(params_obj, dict) else None,
+            )
+        except ValueError as exc:
+            # Rejected settings are the client's to fix. Running the team
+            # without them would silently drop the requested Git identity.
+            logger.warning("[team] execution settings rejected: session_id=%s error=%s", session_id, exc)
+            yield AgentResponseChunk(
+                request_id=rid, channel_id=channel_id,
+                payload={"event_type": "chat.error", "error": str(exc)}, is_complete=True,
+            )
+            return
         if group_input is not None:
             update_session_metadata(session_id=session_id,
                 conversation_type="group_chat",
@@ -4707,6 +5105,17 @@ async def _process_team_message_stream(
                     followup_payload,
                     run_context=run_context,
                 )
+                if not success and reason == "interrupt_already_resolved":
+                    # The in-flight round already consumed this permission card.
+                    # Closing it is the admission; a send error would be false.
+                    logger.info(
+                        "[TeamHelpers] permission answer already resolved by the in-flight round: "
+                        "channel_id=%s session_id=%s",
+                        _resolve_channel_id(channel_id),
+                        session_id,
+                    )
+                    success = True
+                    reason = None
                 if not success:
                     logger.warning(
                         "[TeamHelpers] interact failed: channel_id=%s session_id=%s reason=%s query=%s",
@@ -4741,6 +5150,42 @@ async def _process_team_message_stream(
                         await startup.enter_async_context(
                             team_manager.get_startup_lock(session_id)
                         )
+                        # A teardown hold may have appeared between the
+                        # boundary result and this ownership handoff (a fresh
+                        # pause, a completed stream draining). Wait it out
+                        # while holding the lock — hold owners never take
+                        # this lock — so the new round cannot overlap the
+                        # pause tail's drain or terminal push.
+                        if _team_round_is_draining(team_manager, session_id):
+                            drained = await _await_team_round_teardown(
+                                team_manager,
+                                session_id,
+                                timeout_sec=_TEAM_TEARDOWN_WAIT_TIMEOUT_SEC,
+                            )
+                            if not drained:
+                                # The teardown outlived its budget: end this
+                                # attempt with a retryable error instead of
+                                # starting a new round inside the pause tail.
+                                await _finish_round_submission(accepted=False)
+                                yield AgentResponseChunk(
+                                    request_id=rid,
+                                    channel_id=channel_id,
+                                    payload={
+                                        "event_type": "chat.error",
+                                        "error": _INTERACT_REASON_ERROR_MAP.get(
+                                            "gate_closed",
+                                            "Failed to send message, please try again later",
+                                        ),
+                                    },
+                                    is_complete=False,
+                                )
+                                yield AgentResponseChunk(
+                                    request_id=rid,
+                                    channel_id=channel_id,
+                                    payload=None,
+                                    is_complete=True,
+                                )
+                                return
                         if not await _team_session_has_runtime(team_manager, session_id):
                             break
                         await startup.aclose()
@@ -4796,15 +5241,12 @@ async def _process_team_message_stream(
                     if not success and not is_first_request:
                         await _finish_round_submission(accepted=False)
                         final_reason = reason or ""
-                        # gate_closed 是 shutdown race（leader stream 正在收尾），静默结束流
-                        if final_reason == "gate_closed":
-                            yield AgentResponseChunk(
-                                request_id=rid,
-                                channel_id=channel_id,
-                                payload=None,
-                                is_complete=True,
-                            )
-                            return
+                        # gate_closed used to end the stream silently as a
+                        # shutdown race, which recorded empty successes with no
+                        # answer for the user. Teardown windows are now waited
+                        # out upstream (entry hold + drain guard), so whatever
+                        # still reaches here is a real rejection and must
+                        # surface the mapped error below.
                         error_msg = _INTERACT_REASON_ERROR_MAP.get(
                             final_reason,
                             "Failed to send message, please try again later",
@@ -4845,6 +5287,7 @@ async def _process_team_message_stream(
                         is_complete=False,
                     )
                     if not group_input["mentions"]:
+                        _schedule_group_auto_reply(session_id, group_input)
                         await _release_team_round(
                             team_manager,
                             session_id,
@@ -5135,6 +5578,7 @@ async def _process_team_message_stream(
                                     "client_message_id",
                                 )
                                 if identity == group_input["client_message_id"]:
+                                    _schedule_group_auto_reply(session_id, group_input)
                                     yield _team_processing_done_chunk(
                                         rid,
                                         channel_id,
@@ -5389,10 +5833,22 @@ async def _consume_stream_with_query(
     first_model_output_at: float | None = None
     emitted_ask_user_request_ids: set[str] = set()
     terminal_broadcasted = False
+    # Owned teardown hold taken when team.completed announces this stream is
+    # ending; released in the finally after this producer finished cleanup.
+    # The generator-local flag keeps begin/end strictly paired, so no other
+    # holder's depth level is ever released by this stream.
+    completed_teardown_hold = False
     # Members already announced to clients on this stream, so a roster refresh
     # only emits what is new. See _announce_team_roster.
     announced_members: set[str] = set()
     roster_team_name = str(getattr(team_spec, "team_name", "") or "")
+    npc_team = (getattr(team_spec, "metadata", None) or {}).get("app_role_team") is True
+    npc_titles = {
+        member.member_name: member.display_name for member in team_spec.predefined_members
+    } if npc_team else {}
+    npc_expected_speakers = {team_spec.leader.member_name, *npc_titles} if npc_team else set()
+    npc_spoken: set[str] = set()
+    npc_turn_id = str(round_request_id or "")
     lg: TeamStreamLogger | None = None
     stream_cancelled = False
     # History writer for frames that no waiter receives: the durable pipeline
@@ -5410,7 +5866,20 @@ async def _consume_stream_with_query(
 
     async def _deliver(event: dict[str, Any]) -> None:
         """Broadcast one event and persist it when no waiter received it."""
-        nonlocal writer
+        nonlocal writer, npc_turn_id
+        context = _ACTIVE_ROUND_HISTORY_CONTEXT.get(session_id)
+        if npc_team and event.get("event_type") in {"chat.final", "chat.processing_status"}:
+            turn_id = context.request_id if context is not None else npc_turn_id
+            if turn_id != npc_turn_id:
+                npc_turn_id = turn_id
+                npc_spoken.clear()
+            if npc_turn_id:
+                event["turn_request_id"] = npc_turn_id
+            speaker = event.get("member_name")
+            if event["event_type"] == "chat.final" and event.get("content") and speaker in npc_expected_speakers:
+                npc_spoken.add(speaker)
+            if event.get("is_processing") is False:
+                event["npc_missing_members"] = sorted(npc_expected_speakers - npc_spoken)
         if event.get("event_type") == "chat.final" or (
             event.get("event_type") == "chat.processing_status"
             and event.get("is_processing") is False
@@ -5432,7 +5901,6 @@ async def _consume_stream_with_query(
             if delivered:
                 await writer.handover(event)
                 return
-            context = _ACTIVE_ROUND_HISTORY_CONTEXT.get(session_id)
             if (
                 context is not None
                 and writer.request_id != context.request_id
@@ -5626,6 +6094,9 @@ async def _consume_stream_with_query(
                     run_context=run_context,
                 )
                 if not result:
+                    # Busy and unavailable mean this answer was not admitted.
+                    # The runtime does not re-ask, so the frontend must see a
+                    # terminal error and keep the card retryable.
                     reason = str(getattr(result, "reason", None) or "interrupt_resume_rejected")
                     logger.warning(
                         "[TeamHelpers] interrupt resume interact rejected: "
@@ -5687,13 +6158,20 @@ async def _consume_stream_with_query(
                         session_id, getattr(chunk, "role", None), getattr(chunk, "type", None),
                     )
                 continue
-            # Optional: filter out all non-leader frames so the frontend only
-            # sees leader output. Leader-level control events
-            # (team.runtime_ready / team.completed) are kept because
-            # _is_leader_output returns True.
-            if _team_hide_teammate_enabled() and not is_leader:
-                continue
+            # Optional: filter out non-leader frames so the frontend only sees
+            # leader output. Parse first: a teammate permission card is the
+            # one non-leader frame that must still reach the user. Leader
+            # control events stay because _is_leader_output returns True.
+            # NPC Team sessions need every member's final speech, so they skip
+            # the teammate filter entirely.
             parsed = await run_stream_parser(parse_stream_chunk, chunk)
+            hide_teammate = (
+                _team_hide_teammate_enabled()
+                and not is_leader
+                and not _is_teammate_permission_card(parsed)
+            )
+            if not npc_team and hide_teammate:
+                continue
             if parsed is not None:
                 if (
                     parsed.get("event_type") == "chat.error"
@@ -5733,10 +6211,13 @@ async def _consume_stream_with_query(
                     continue
                 if _is_duplicate_ask_user_question(parsed, emitted_ask_user_request_ids):
                     continue
-                # Skip non-leader __interaction__ (permission ASK) — approval
-                # is routed internally via the leader; only leader
-                # interactions are forwarded to the frontend.
-                if not is_leader and parsed.get("event_type") == "chat.ask_user_question":
+                # Teammate questions stay off the frontend, except the user
+                # permission card, which keeps the member identity.
+                if (
+                    not is_leader
+                    and parsed.get("event_type") == "chat.ask_user_question"
+                    and parsed.get("source") != "permission_interrupt"
+                ):
                     continue
                 parsed["rid"] = round_id
                 # 标注来源 team，让前端能把这一帧分流到对应 team 的对话视图。
@@ -5772,6 +6253,16 @@ async def _consume_stream_with_query(
                         backend = await resolve_group_backend(group)
                         if backend is not None:
                             await sync_group_roster(group, backend)
+                            try:
+                                from jiuwenswarm.server.runtime.group_auto_reply import recover_group
+
+                                # Notifications decided while this runtime was away are delivered now.
+                                await recover_group(session_id)
+                            except Exception:
+                                logger.warning(
+                                    "[TeamHelpers] group auto reply recovery failed session_id=%s",
+                                    session_id, exc_info=True,
+                                )
                     await tm.attach_distributed_hooks_for_runner_runtime(
                         team_name=ready_team_name,
                         session_id=session_id,
@@ -5840,6 +6331,31 @@ async def _consume_stream_with_query(
                     )
                     terminal_broadcasted = True
                     continue
+                elif parsed.get("event_type") == "team.goal.blocked":
+                    # Core keeps the resident stream open for later user input.
+                    # End this request's processing state without completing its tasks.
+                    fallback = (
+                        "The leader goal is blocked. Add input to continue."
+                        if str(getattr(team_spec, "language", "cn")) == "en"
+                        else "领导目标已阻塞，请补充输入后继续。"
+                    )
+                    await _deliver({
+                        "event_type": "chat.error",
+                        "error": str(parsed.get("reason") or fallback),
+                        "code": "TEAM_GOAL_BLOCKED",
+                        "session_id": session_id,
+                        "rid": round_id,
+                    })
+                    await _deliver({
+                        "event_type": "chat.processing_status",
+                        "session_id": session_id,
+                        "rid": round_id,
+                        "is_processing": False,
+                        "is_complete": True,
+                        "reason": "team.goal.blocked",
+                    })
+                    terminal_broadcasted = True
+                    continue
                 elif parsed.get("event_type") == "team.completed":
                     # Team completed this round — broadcast a single
                     # round-complete signal that also carries team stats.
@@ -5852,6 +6368,20 @@ async def _consume_stream_with_query(
                         round_request_id,
                         round_id,
                     )
+                    # team.completed ends this stream: the leader has stopped
+                    # and Core closes the interact gate only after finalize,
+                    # so follow-ups delivered now can only hit the dead
+                    # leader. Hold new input until this producer's finally
+                    # finished cleanup (team.idle deliberately does NOT take
+                    # this hold: its stream stays open for the next message
+                    # to wake).
+                    if not completed_teardown_hold:
+                        begin_hold = getattr(
+                            get_team_manager(channel_id), "begin_request_stop", None
+                        )
+                        if callable(begin_hold):
+                            begin_hold(session_id)
+                            completed_teardown_hold = True
                     await _deliver(
                         _quiet_round_status_payload(
                             session_id,
@@ -5966,6 +6496,16 @@ async def _consume_stream_with_query(
                         terminal_broadcasted = True
                     continue
                 if parsed.get("event_type") == "chat.final":
+                    if npc_team:
+                        speaker = str(getattr(chunk, "source_member", None) or "")
+                        if is_leader:
+                            speaker = team_spec.leader.member_name
+                            parsed["display_name"] = team_spec.leader.display_name
+                        elif speaker in npc_titles:
+                            parsed["display_name"] = npc_titles[speaker]
+                        else:
+                            continue
+                        parsed["member_name"] = speaker
                     # A persistent Team stream may emit several leader finals
                     # within one real round.  They are result content, not a
                     # lifecycle boundary.  Only team.completed/team.idle,
@@ -6085,50 +6625,69 @@ async def _consume_stream_with_query(
                     team_name=roster_team_name,
                 )
         finally:
-            try:
-                if writer is not None:
-                    # Mirror the durable pipeline's stream end: only trailing
-                    # reasoning gets a fallback record; half-streamed final
-                    # text is deliberately not written as a chat.final.
-                    await writer.flush_pending_reasoning()
-            except Exception:
-                logger.debug(
-                    "[TeamHelpers] unattended history reasoning flush failed: "
-                    "session_id=%s",
-                    session_id,
-                    exc_info=True,
-                )
             # Registry release must run even if cancellation arrives while a
             # normal stream is delivering its final snapshot.
             team_manager = get_team_manager(channel_id)
-            release_current_round = getattr(
-                team_manager, "release_current_round", None
-            )
-            if callable(release_current_round):
-                await release_current_round(session_id)
-            team_manager.clear_pending_runtime(session_id)
-            clear_active_runtime = getattr(team_manager, "clear_active_runtime", None)
-            if callable(clear_active_runtime):
-                clear_active_runtime(session_id)
-            _pop_team_stream_task(
-                team_manager,
-                session_id,
-                generation=generation,
-            )
-            if hold_refresh_task is not None:
-                hold_refresh_task.cancel()
-                try:
-                    await hold_refresh_task
-                except (asyncio.CancelledError, Exception):
-                    pass
             try:
-                await _release_stream_team_create(session_id)
-            except Exception:
-                logger.debug(
-                    "[TeamHelpers] stream end team-create release failed: session_id=%s",
-                    session_id,
-                    exc_info=True,
+                try:
+                    if writer is not None:
+                        # Mirror the durable pipeline's stream end: only trailing
+                        # reasoning gets a fallback record; half-streamed final
+                        # text is deliberately not written as a chat.final.
+                        await writer.flush_pending_reasoning()
+                except Exception:
+                    logger.debug(
+                        "[TeamHelpers] unattended history reasoning flush failed: "
+                        "session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
+                release_current_round = getattr(
+                    team_manager, "release_current_round", None
                 )
+                if callable(release_current_round):
+                    await release_current_round(session_id)
+                if hold_refresh_task is not None:
+                    hold_refresh_task.cancel()
+                    try:
+                        await hold_refresh_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                try:
+                    await _release_stream_team_create(session_id)
+                except Exception:
+                    logger.debug(
+                        "[TeamHelpers] stream end team-create release failed: session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
+            finally:
+                # The registration drops must not be skipped when
+                # release_current_round raised or was cancelled: a stale
+                # stream task would classify the next message as a follow-up
+                # of the dead runtime. These steps are plain registry
+                # operations with no awaits, so they complete even under
+                # cancellation, and they run BEFORE the gate release below so
+                # no message is admitted against leftover registrations.
+                team_manager.clear_pending_runtime(session_id)
+                clear_active_runtime = getattr(team_manager, "clear_active_runtime", None)
+                if callable(clear_active_runtime):
+                    clear_active_runtime(session_id)
+                _pop_team_stream_task(
+                    team_manager,
+                    session_id,
+                    generation=generation,
+                )
+                # Release the completed-stream hold even when a cleanup step
+                # raised above — otherwise new input would queue forever on a
+                # gate nobody will ever open again. The registration stays
+                # paired with this release (never an ownerless release), and
+                # it runs last so the ancillary cleanup settles before new
+                # input is admitted.
+                if completed_teardown_hold:
+                    end_hold = getattr(team_manager, "end_request_stop", None)
+                    if callable(end_hold):
+                        end_hold(session_id)
 
 
 async def _consume_monitor_events(

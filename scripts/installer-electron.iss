@@ -1,9 +1,15 @@
 ; JiuwenSwarm Electron Installer Script (Windows)
-; 用法: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" scripts\installer-electron.iss
+; 使用 build-electron-exe.ps1，优先 Inno Setup 7。
 ; 应用名 / 版本号 / 壳 exe 名 / 后端 exe 名由 build-electron-exe.ps1 经
 ; /DMyAppName=... /DMyAppVersion=... /DMyAppExeName=... /DBackendExecutableName=...
 ; 传入（来自 build_config，与 pyproject 单一来源，与 installer.iss 的 WorkSwarm
 ; 显示名一致）；直接编译且未传 /D 时使用下方默认值。
+
+#if Ver < EncodeVer(7,0,0,0)
+  #ifndef MaxPayloadRelativePath
+    #error MaxPayloadRelativePath is required for Inno Setup 6. Use scripts/build-electron-exe.ps1.
+  #endif
+#endif
 
 #ifndef MyAppName
   #define MyAppName "WorkSwarm"
@@ -100,6 +106,8 @@ Type: files; Name: "{app}\logo-*.ico"; Check: IsExistingPerUserInstallDir
 ; 卸载前重置外部 CLI 开关（与 installer.iss 一致；Web UI 也能安装外部 CLI，
 ; 其配置在用户目录，需要后端 exe 显式清理）。FrontendOnly 包无后端，跳过。
 Filename: "{app}\resources\backend\{#BackendExecutableName}"; Parameters: "--desktop-reset-external-cli-config"; Flags: runhidden waituntilterminated; RunOnceId: "ResetExternalCliConfig"
+; 撤销 Office 加载项的注册与 localhost 证书信任（都在用户目录与注册表里，卸载程序看不到）。
+Filename: "{app}\resources\backend\{#BackendExecutableName}"; Parameters: "--desktop-remove-office-addins"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveOfficeAddins"
 #endif
 
 [Icons]
@@ -281,6 +289,14 @@ begin
   // Do not remove the installed app until the user confirms installation.
   // This also leaves it intact when a distribution's license is declined.
   Result := '';
+  #if Ver < EncodeVer(7,0,0,0)
+    // Inno 6 cannot install long paths. Check before touching the old install.
+    if Length(ExpandConstant('{app}')) + 1 + {#MaxPayloadRelativePath} > 249 then
+    begin
+      Result := '安装路径太长。请选择更短的目录，例如 D:\WorkSwarm。';
+      Exit;
+    end;
+  #endif
   if not PreserveWindowsCli(ExpandConstant('{app}'), 'Preserve') then
   begin
     Result := 'External CLI preservation failed; installation stopped before cleanup.';
@@ -310,3 +326,51 @@ begin
     FinishCliProgress;
   end;
 end;
+
+#ifndef ELECTRON_FRONTEND_ONLY
+function StopTimedOutEmailCleanup(Handle, ExitCode: LongWord): Boolean;
+  external 'TerminateProcess@kernel32.dll stdcall uninstallonly';
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Startup: TCliStartupInfo;
+  Child: TCliProcessInfo;
+  BackendPath: String;
+  WaitResult, ExitCode: LongWord;
+begin
+  if CurUninstallStep <> usUninstall then
+    Exit;
+  if not FileExists(ExpandConstant('{app}\resources\backend\runtime\node-runtime\node.exe')) then
+  begin
+    Log('Bundled Node executable is missing. Skipping email-mcp cleanup.');
+    Exit;
+  end;
+
+  BackendPath := ExpandConstant('{app}\resources\backend\{#BackendExecutableName}');
+  InitializeHiddenCliStartup(Startup);
+  if not CliCreateProcess(BackendPath, '"' + BackendPath + '" --desktop-stop-bundled-email-mcp',
+    0, 0, False, $08000000, 0, 0, Startup, Child) then
+  begin
+    Log('Could not start email-mcp cleanup. Continuing uninstall.');
+    Exit;
+  end;
+  CliCloseHandle(Child.Thread);
+  try
+    WaitResult := CliWaitForSingleObject(Child.Process, 6000);
+    if WaitResult = $102 then
+    begin
+      if StopTimedOutEmailCleanup(Child.Process, 1) then
+        CliWaitForSingleObject(Child.Process, 500);
+      Log('Email-mcp cleanup timed out. Continuing uninstall.');
+    end
+    else if WaitResult <> 0 then
+      Log('Email-mcp cleanup wait failed. Continuing uninstall.')
+    else if not CliGetExitCodeProcess(Child.Process, ExitCode) then
+      Log('Could not read email-mcp cleanup exit code. Continuing uninstall.')
+    else if ExitCode <> 0 then
+      Log(Format('Email-mcp cleanup failed (code %d). Continuing uninstall.', [ExitCode]));
+  finally
+    CliCloseHandle(Child.Process);
+  end;
+end;
+#endif

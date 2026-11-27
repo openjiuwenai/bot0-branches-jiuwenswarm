@@ -1,8 +1,12 @@
+import type { JiuwenMateCategory } from '../jiuwenmate/types';
 import type { ModelSelection, AskUserQuestionPayload, UserAnswer } from '../../types';
 import { webClient, webRequest } from '../../services/webClient';
 
 export interface GroupMember {
-  kind: 'agent_template' | 'agent_group';
+  kind: 'agent_template' | 'agent_group' | 'colleague';
+  avatar_url?: string;
+  colleague_category?: JiuwenMateCategory;
+  is_default?: boolean;
   cli_agent?: 'claude' | 'codex';
   id: string;
   member_name: string;
@@ -23,7 +27,24 @@ export interface GroupRoute {
   reply_message_id?: string | null;
 }
 
+/** One unmentioned user message as judged by the group's auto-reply model. */
+export interface GroupAutoReply {
+  status: 'pending' | 'notified' | 'none' | 'failed' | 'stopped';
+  client_message_id?: string | null;
+  /** member_name of every member asked to respond. */
+  notified: string[];
+  /** Set when the model asked expert teams for one joint result; then only the owner is notified. */
+  organization?: { owner: string; members: string[] };
+}
+
+export interface GroupAutoReplySettings {
+  enabled: boolean;
+  /** null judges with the group session model. */
+  model_selection: ModelSelection | null;
+}
+
 export interface GroupInfo {
+  auto_reply?: GroupAutoReplySettings;
   organization_routes?: GroupRoute[];
   pending_questions?: GroupQuestion[];
   group_id: string;
@@ -33,6 +54,7 @@ export interface GroupInfo {
   description: string;
   avatar: string;
   members: GroupMember[];
+  former_members?: GroupMember[];
   configs: Record<string, unknown>;
   created_at: number;
   updated_at: number;
@@ -72,15 +94,26 @@ export const groupChatClient = {
   get: (groupId: string) => webRequest<GroupInfo>('group.get', { group_id: groupId }),
   list: (page: PageInput = {}) =>
     webRequest<{ groups: GroupInfo[]; total: number; limit: number; offset: number }>('group.list', { ...page }),
-  update: (groupId: string, patch: { name?: string; description?: string; avatar?: string }) =>
+  update: (groupId: string, patch: {
+    name?: string; description?: string; avatar?: string;
+    auto_reply?: Partial<GroupAutoReplySettings>;
+  }) =>
     webRequest<GroupInfo>('group.update', { group_id: groupId, ...patch }),
   addMember: (groupId: string, member: GroupMember, clientRequestId: string) =>
     webRequest<{ group_id: string; member: GroupMember; status: 'registered'; event_type: 'group.member.added' }>(
       'group.member.add',
       { group_id: groupId, member, client_request_id: clientRequestId },
     ),
+  removeMember: (groupId: string, memberName: string, clientRequestId: string) =>
+    webRequest<{ group_id: string; member_name: string; member: GroupMember; status: 'removed'; event_type: 'group.member.removed' }>(
+      'group.member.remove',
+      { group_id: groupId, member_name: memberName, client_request_id: clientRequestId },
+    ),
   history: (groupId: string, page: PageInput = {}) =>
-    webRequest<{ messages: GroupMessage[]; total: number; next_offset: number | null; limit: number; offset: number }>(
+    webRequest<{
+      messages: GroupMessage[]; total: number; next_offset: number | null; limit: number; offset: number;
+      auto_replies?: Record<string, GroupAutoReply>;
+    }>(
       'group.history.get',
       { group_id: groupId, ...page },
     ),

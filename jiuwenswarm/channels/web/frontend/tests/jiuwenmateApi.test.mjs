@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -57,6 +58,31 @@ test('DingTalk authorization methods keep their RPC names, scope and response en
   assert.equal(calls[2].params.operation_id, 'operation');
   assert.equal(calls[3].params.operation_id, 'operation');
 });
+
+for (const code of ['authorization_process_unverified', 'authorization_cleanup_failed']) {
+  test(`DingTalk status and polling retain ${code} without treating it as expiry`, async () => {
+    const status = { status: 'error', cli_version: '1.0.65', error_code: code };
+    const calls = [];
+    const api = createJiuwenMateApi(async (method, params) => {
+      calls.push({ method, params });
+      return { dingtalk_auth: status };
+    });
+
+    assert.deepEqual(await api.dingtalkAuthStatus('agent-1', 'ding-app'), status);
+    assert.deepEqual(await api.pollDingTalkAuth('agent-1', 'ding-app', 'operation'), status);
+    assert.deepEqual(calls.map(({ method }) => method), [
+      'jiuwenmate.dingtalk_auth.status', 'jiuwenmate.dingtalk_auth.poll',
+    ]);
+    for (const language of ['zh', 'en']) {
+      const locale = JSON.parse(readFileSync(new URL(`../src/i18n/locales/${language}.json`, import.meta.url), 'utf8'));
+      const message = locale.jiuwenmate.profile.dingtalkAuth.failures[status.error_code];
+      assert.equal(typeof message, 'string', `${language} must describe the returned authorization error`);
+      assert.ok(message.trim());
+    }
+    assert.ok(calls.every(({ params }) => params.agent_id === 'agent-1' && params.connection_key === 'ding-app'));
+    assert.equal(calls[1].params.operation_id, 'operation');
+  });
+}
 
 const wireColleague = {
   agent_id: 'agent-1',
@@ -665,7 +691,7 @@ test('activity payload keeps counts and drops a member without an id', () => {
         failures: 1,
         companion_days: 16,
         last_response_at: '2026-10-16T10:00:00+00:00',
-        days: [{ date: '2026-10-16', tasks: 2, minutes: 90, calls: 2, tokens: 65 }],
+        days: [{ date: '2026-10-16', tasks: 2, replies: 1, minutes: 90, calls: 2, tokens: 65 }],
         hours: [{ date: '2026-10-16', hour: 10, minutes: 0, tasks: 1, tokens: 65 }],
         channels: [{ channel: 'web', calls: 2, tokens: 65, tasks: 2, replies: 1, failures: 1 }],
         groups: [],
@@ -690,6 +716,7 @@ test('activity payload keeps counts and drops a member without an id', () => {
   assert.equal(activity.members[0].tokens, 65);
   assert.equal(activity.members[0].replies, 1);
   assert.equal(activity.members[0].failures, 1);
+  assert.deepEqual(activity.members[0].days, [{ date: '2026-10-16', tasks: 2, replies: 1, minutes: 90, calls: 2, tokens: 65 }]);
   assert.deepEqual(activity.members[0].hours, [{ date: '2026-10-16', hour: 10, minutes: 0, tasks: 1, tokens: 65 }]);
   assert.deepEqual(activity.members[0].kinds, [{ date: '2026-10-16', conversation: 1, channel: 0, schedule: 1 }]);
   assert.deepEqual(activity.members[0].history, [
@@ -946,8 +973,8 @@ test('binding and unbinding an IM app name the colleague configuration and the a
       config_id: 'agent-1', client_id: 'ding-app', client_secret: 'test-secret', robot_code: 'robot',
     }],
     ['channel.feishu.bind_agent', { config_id: 'agent-1', app_id: 'cli-app', app_secret: 'test-secret' }],
-    ['channel.dingtalk.unbind_agent', { client_id: 'ding-app' }],
-    ['channel.feishu.unbind_agent', { app_id: 'cli-app' }],
+    ['channel.dingtalk.unbind_agent', { client_id: 'ding-app', persistent_agent_id: 'agent-ding' }],
+    ['channel.feishu.unbind_agent', { app_id: 'cli-app', persistent_agent_id: 'agent-feishu' }],
   ]);
 });
 

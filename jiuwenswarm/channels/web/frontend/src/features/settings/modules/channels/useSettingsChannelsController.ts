@@ -42,6 +42,7 @@ import type {
   PendingDiscardAction,
   SettingsChannelId,
 } from './channelTypes';
+import { useChannelControllersStatus } from './useChannelControllersStatus';
 import { useChannelForm } from './useChannelForm';
 
 export function useSettingsChannelsController({
@@ -71,7 +72,7 @@ export function useSettingsChannelsController({
       setChannels(buildSettingsChannels(payload?.channels));
     } catch (error) {
       setChannels(buildSettingsChannels([]));
-      setChannelsError(error instanceof Error ? error.message : t('channels.errors.loadChannels'));
+      setChannelsError(error instanceof Error && error.message ? error.message : t('channels.errors.loadChannels'));
     } finally {
       setChannelsLoading(false);
     }
@@ -98,6 +99,7 @@ export function useSettingsChannelsController({
     setMethod: 'channel.feishu.set_conf',
     loadErrorMessage: t('channels.errors.loadFeishu'),
     saveErrorMessage: t('channels.errors.saveGeneric'),
+    saveErrorByCode: { CHANNEL_BOUND_TO_EMPLOYEE: t('channels.errors.boundToEmployee') },
     savedMessage: t('channels.saved.feishu'),
     onSaved: loadChannels,
   });
@@ -110,6 +112,7 @@ export function useSettingsChannelsController({
     setMethod: 'channel.dingtalk.set_conf',
     loadErrorMessage: t('channels.errors.loadDingtalk'),
     saveErrorMessage: t('channels.errors.saveGeneric'),
+    saveErrorByCode: { CHANNEL_BOUND_TO_EMPLOYEE: t('channels.errors.boundToEmployee') },
     savedMessage: t('channels.saved.dingtalk'),
     onSaved: loadChannels,
   });
@@ -163,6 +166,8 @@ export function useSettingsChannelsController({
   });
 
   const controllers = { xiaoyi, feishu, dingtalk, telegram, discord, slack, whatsapp };
+  const { configurationsLoading, configurationsError, toastNotice, reloadChannels } =
+    useChannelControllersStatus(controllers, loadChannels, dialogOpen, activeChannelId);
   const activeController = controllers[activeChannelId];
   const hasActiveDialogChanges = activeDialogBaseline
     ? !deepEqual(activeController.form.getValues(), activeDialogBaseline)
@@ -200,18 +205,6 @@ export function useSettingsChannelsController({
   useEffect(() => {
     void loadChannels();
   }, [loadChannels]);
-
-  useEffect(() => {
-    void Promise.all([
-      xiaoyi.load(),
-      feishu.load(),
-      dingtalk.load(),
-      telegram.load(),
-      discord.load(),
-      slack.load(),
-      whatsapp.load(),
-    ]);
-  }, [dingtalk.load, discord.load, feishu.load, slack.load, telegram.load, whatsapp.load, xiaoyi.load]);
 
   useEffect(() => {
     onHasChangesChange?.(hasActiveDialogChanges);
@@ -399,14 +392,6 @@ export function useSettingsChannelsController({
     if (deleted) setPendingDeletion(null);
   };
 
-  const errorNotice = Array.from(
-    new Set(
-      Object.values(controllers)
-        .map((controller) => controller.error)
-        .filter((message): message is string => Boolean(message)),
-    ),
-  ).join(t('common.and'));
-
   return {
     channels,
     channelsLoading,
@@ -424,9 +409,10 @@ export function useSettingsChannelsController({
     channelEnabled,
     channelConfigured,
     channelSaving,
-    configurationsLoading: Object.values(controllers).some((controller) => !controller.loaded || controller.loading),
-    errorNotice,
-    loadChannels,
+    configurationsLoading,
+    configurationsError,
+    toastNotice,
+    reloadChannels,
     selectChannel,
     editChannel,
     addFeishuConfiguration,

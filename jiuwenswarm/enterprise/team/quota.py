@@ -282,22 +282,45 @@ def teammate_spawn_key(team_id: str, member_name: str) -> str:
     return f"team:{_clean(team_id)}:member:{_clean(member_name)}"
 
 
-def team_create_quota_user_message(limit: int) -> str:
+def _t(message_id: str, *, language: str | None = None, **params: Any) -> str:
+    from jiuwenswarm.common.i18n import t
+    from jiuwenswarm.enterprise.config.preferred_language import (
+        resolve_preferred_language,
+    )
+
+    return t(
+        message_id,
+        language=language if language is not None else resolve_preferred_language(),
+        **params,
+    )
+
+
+def team_create_quota_user_message(limit: int, *, language: str | None = None) -> str:
     """User-facing X-quota failure. ``limit`` is max teams per user."""
-    return f"创建失败，一个用户最多有{max(int(limit), 0)}个团队"
+    return _t(
+        "enterprise.team.create_user_full",
+        language=language,
+        limit=max(int(limit), 0),
+    )
 
 
-def org_team_create_quota_user_message(limit: int) -> str:
+def org_team_create_quota_user_message(limit: int, *, language: str | None = None) -> str:
     """User-facing Z-quota failure. ``limit`` is max teams in the organization."""
-    return f"创建失败，一个组织最多有{max(int(limit), 0)}个团队"
+    return _t(
+        "enterprise.team.create_org_full",
+        language=language,
+        limit=max(int(limit), 0),
+    )
 
 
-def team_quota_user_message(exc: TeamQuotaExceeded) -> str:
-    """Chinese sentence for a create-time quota block. Other kinds stay internal."""
+def team_quota_user_message(
+    exc: TeamQuotaExceeded, *, language: str | None = None
+) -> str:
+    """Localized sentence for a create-time quota block. Other kinds stay internal."""
     if exc.kind == KIND_ORG_TEAM_CREATE:
-        return org_team_create_quota_user_message(exc.limit)
+        return org_team_create_quota_user_message(exc.limit, language=language)
     if exc.kind == KIND_TEAM_CREATE:
-        return team_create_quota_user_message(exc.limit)
+        return team_create_quota_user_message(exc.limit, language=language)
     return str(exc)
 
 
@@ -315,7 +338,7 @@ def teammate_spawn_slots(team_limit_including_leader: int) -> int:
 
 
 def count_predefined_non_leaders(config_base: dict[str, Any] | None, template_id: str | None) -> int:
-    """How many template members would occupy Y (role != leader)."""
+    """How many template members occupy Y, excluding leader and host-managed identities."""
     cfg = config_base if isinstance(config_base, dict) else {}
     modes = cfg.get("modes") if isinstance(cfg.get("modes"), dict) else {}
     teams = modes.get("team") if isinstance(modes.get("team"), dict) else {}
@@ -340,7 +363,7 @@ def count_predefined_non_leaders(config_base: dict[str, Any] | None, template_id
         if not _clean(item.get("member_name")):
             continue
         role = _clean(item.get("role_type") or item.get("role") or "teammate").lower()
-        if role != "leader":
+        if role not in {"leader", "host_managed"}:
             n += 1
     return n
 
@@ -384,6 +407,9 @@ def _insert_ignore_sql(mysql_sql: str, postgres_sql: str) -> str:
 
 class TeamQuotaService(TeamQuotaPolicyStore):
     """Process-wide quota operations. Backed by Gateway MySQL or local SQLite."""
+
+    def use_shared_store(self) -> bool:
+        return self._use_mysql()
 
     @staticmethod
     def _default_sqlite_path() -> Path:
@@ -766,7 +792,13 @@ class TeamQuotaService(TeamQuotaPolicyStore):
             "status": _clean(found["status"]),
         }
 
-    def drop_occupancy(self, *, session_id: str = "", team_id: str = "") -> None:
+    def drop_occupancy(
+        self,
+        *,
+        session_id: str = "",
+        team_id: str = "",
+        session_only: bool = False,
+    ) -> None:
         """Physically delete X/Y lease rows for a deleted session or team.
 
         ``team.stop`` keeps rows as ``released``. Session delete follows develop
@@ -774,10 +806,14 @@ class TeamQuotaService(TeamQuotaPolicyStore):
 
         When only ``session_id`` is known, the create-lease ``team_id`` is
         resolved so teammate (Y) rows are dropped with the X row.
+
+        ``session_only`` drops just this Session's create lease. A team delete
+        that failed for some Sessions keeps the team and its survivors, so their
+        rows must stay.
         """
         sid = _clean(session_id)
-        tid = _clean(team_id)
-        if not tid and sid:
+        tid = "" if session_only else _clean(team_id)
+        if not session_only and not tid and sid:
             try:
                 peeked = self.peek_team_create_lease(sid)
             except Exception:  # noqa: BLE001
@@ -1302,13 +1338,15 @@ class TeamQuotaService(TeamQuotaPolicyStore):
                     )
                     return lease
 
-                await conn.execute(
-                    text(
-                        "UPDATE team_quota_lease SET status=:rel, updated_at=:now "
-                        "WHERE status=:res AND expires_at IS NOT NULL AND expires_at<=:now"
-                    ),
-                    {"rel": STATUS_RELEASED, "now": now, "res": STATUS_RESERVED},
+                cleanup_sql = (
+                    "UPDATE team_quota_lease SET status=:rel, updated_at=:now "
+                    "WHERE status=:res AND expires_at IS NOT NULL AND expires_at<=:now"
                 )
+                cleanup_params = {"rel": STATUS_RELEASED, "now": now, "res": STATUS_RESERVED}
+                if lock == "team" and _clean(team_id):
+                    cleanup_sql += " AND kind=:kind AND team_id=:tid"
+                    cleanup_params.update(kind=kind, tid=_clean(team_id))
+                await conn.execute(text(cleanup_sql), cleanup_params)
                 await conn.execute(text(_ABANDONED_HOLD_SQL), _abandoned_hold_params(now))
                 if on_existing != "ignore" and session_id:
                     entity_row = (

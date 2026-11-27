@@ -17,6 +17,7 @@ import {
   useCronStore,
   useGoalStore,
   useHarnessStore,
+  usePlanStore,
   useSessionStore,
   useSubagentStore,
   useTodoStore,
@@ -109,11 +110,19 @@ export async function toggleSessionPin(session: Session, translate: Translate): 
   try {
     await useWorkspaceStore.getState().pinSession(session.session_id, !session.pinned);
   } catch (error) {
-    toast.open({
-      content: `${translate('multiSession.project.pinFailed')}: ${error instanceof Error ? error.message : String(error)}`,
-      variant: 'error',
-      wide: true,
-    });
+    // 缺任务标识的存量 cron 会话被后端 FORBIDDEN 拒绝：给出可读原因而不是
+    // 生涩的通用失败文案（会话仍留在原列表，用户不会丢失入口）。
+    if (getArchiveErrorCode(error) === 'FORBIDDEN') {
+      toast.open({
+        content: translate('multiSession.project.errors.pinCronNoIdentity'),
+        variant: 'error',
+      });
+    } else {
+      toast.open({
+        content: `${translate('multiSession.project.pinFailed')}: ${error instanceof Error ? error.message : String(error)}`,
+        variant: 'error',
+      });
+    }
   } finally {
     refreshExpandedCronSessions();
   }
@@ -124,7 +133,6 @@ function openArchiveFailureToast(content: string) {
     content,
     variant: 'error',
     duration: 5,
-    wide: true,
   });
 }
 
@@ -158,7 +166,6 @@ function openArchiveSuccessToast(
     content: options.content,
     icon: createElement(Archive, { 'aria-hidden': true, size: 16, strokeWidth: 1.8 }),
     duration: 5,
-    wide: true,
     actions: [
       {
         label: translate('multiSession.project.archiveView'),
@@ -325,6 +332,10 @@ export function useSidebarMenu(options: SidebarMenuOptions): {
     useTodoStore.getState().removeRuntime(sessionId);
     useHarnessStore.getState().removeRuntime(sessionId);
     useGoalStore.getState().removeRuntime(sessionId);
+    // Plan 模式的 runtime（active、pendingExplicitEntry）也按 session 挂在内存里，
+    // 侧边栏删除漏掉它会让已删会话的 plan 状态永久残留；App.tsx 的
+    // handleTeamSessionsDeleted 删除路径已包含这条，这里对齐补齐。
+    usePlanStore.getState().removeRuntime(sessionId);
   }
 
   async function archiveSessionAction(session: Session) {

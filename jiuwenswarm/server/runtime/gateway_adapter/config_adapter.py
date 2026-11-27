@@ -126,6 +126,17 @@ async def reload_runtime_after_config_save(
         if isinstance(scope, str) and scope
     }
     target_channel = str(options.get("target_channel_id") or "").strip() or None
+    from jiuwenswarm.common.config import get_config
+    from jiuwenswarm.server.runtime.memory_portal import get_memory_portal_service
+
+    try:
+        await get_memory_portal_service().configure(
+            config_payload if isinstance(config_payload, dict) and "memory" in config_payload else get_config()
+        )
+    except Exception as exc:  # Portal failures must not block Agent configuration reload.
+        logger.warning("Memory Portal configuration update failed (%s)", type(exc).__name__)
+    if set(_updated_keys or []) == {"memory_portal_enabled"} and not env_updates:
+        return True
     if "permissions" in scopes:
         target_channel = None
     await agent_manager.reload_agents_config(
@@ -144,6 +155,7 @@ class ConfigAdapter(GatewayAdapter):
         self._on_config_saved = on_config_saved
 
     methods = frozenset({
+        ReqMethod.MEMORY_PORTAL_OPEN.value,
         ReqMethod.CONFIG_GET.value,
         ReqMethod.CONFIG_MOA_STATUS.value,
         ReqMethod.CONFIG_SET.value,
@@ -174,6 +186,16 @@ class ConfigAdapter(GatewayAdapter):
     })
 
     async def handle(self, request: AgentRequest) -> AgentResponse:
+        if request.req_method == ReqMethod.MEMORY_PORTAL_OPEN:
+            from jiuwenswarm.common.config import get_config
+            from jiuwenswarm.server.runtime.memory_portal import get_memory_portal_service
+
+            return AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id,
+                ok=True, payload=await get_memory_portal_service().open(get_config()),
+                metadata=request.metadata,
+            )
+
         if request.req_method in {ReqMethod.CONFIG_SET, ReqMethod.CONFIG_SAVE_ALL}:
             from jiuwenswarm.common.config import get_config_raw
             from jiuwenswarm.common.multimodal_models import CAPABILITIES, MultimodalError
@@ -229,11 +251,38 @@ class ConfigAdapter(GatewayAdapter):
                 get_config,
                 update_preferred_language_in_config,
             )
+            from jiuwenswarm.enterprise.edition import is_enterprise
+
+            # 企业版 locale 在 Gateway 终结（写 user_preference），AS 不再写 yaml。
+            if is_enterprise():
+                from jiuwenswarm.enterprise.config.preferred_language import (
+                    resolve_preferred_language_async,
+                )
+                from jiuwenswarm.enterprise.tenant.tenant_identity import extract_triple
+
+                _g, _b, user_id = extract_triple(request)
+                if request.req_method == ReqMethod.LOCALE_GET_CONF:
+                    lang = await resolve_preferred_language_async(user_id)
+                    return AgentResponse(
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        ok=True,
+                        payload={"preferred_language": lang},
+                        metadata=request.metadata,
+                    )
+                return build_error_response(
+                    request,
+                    "enterprise locale.set_conf is handled by Gateway; "
+                    "AgentServer does not write preferred_language",
+                    code="NOT_SUPPORTED",
+                )
 
             if request.req_method == ReqMethod.LOCALE_GET_CONF:
-                lang = str(get_config().get("preferred_language") or "zh").strip().lower()
-                if lang not in {"zh", "en"}:
-                    lang = "zh"
+                from jiuwenswarm.common.i18n import normalize_preferred_language
+
+                lang = normalize_preferred_language(
+                    get_config().get("preferred_language")
+                )
                 return AgentResponse(
                     request_id=request.request_id, channel_id=request.channel_id,
                     ok=True, payload={"preferred_language": lang}, metadata=request.metadata,
@@ -245,6 +294,19 @@ class ConfigAdapter(GatewayAdapter):
                 )
             lang = raw_lang.strip().lower()
             update_preferred_language_in_config(lang)
+            from jiuwenswarm.server.runtime.recommendation_host import (
+                active_recommendation_host,
+            )
+
+            host = active_recommendation_host()
+            if host is not None:
+                try:
+                    await host.on_language_changed(lang)
+                except Exception:  # noqa: BLE001 - language save must still succeed
+                    logger.warning(
+                        "[Config] recommendation language refresh failed",
+                        exc_info=True,
+                    )
             return AgentResponse(
                 request_id=request.request_id, channel_id=request.channel_id,
                 ok=True, payload={"preferred_language": lang}, metadata=request.metadata,

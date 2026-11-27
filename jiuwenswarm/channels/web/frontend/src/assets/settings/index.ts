@@ -2,11 +2,13 @@ import type { FunctionComponent, SVGProps } from 'react';
 import GeneralIcon from './navigation/general.svg?react';
 import ModelsIcon from './navigation/models.svg?react';
 import AgentIcon from './navigation/agent.svg?react';
+import MemoryIcon from '../memory.svg?react';
 import BrowserIcon from './navigation/browser.svg?react';
 import ChannelsIcon from './navigation/channels.svg?react';
 import PersonalContextIcon from './navigation/personal-context.svg?react';
 import ExperimentalIcon from './navigation/experimental.svg?react';
 import AppearanceIcon from './navigation/appearance.svg?react';
+import RecoveryIcon from './navigation/recovery.svg?react';
 import RefreshIcon from './actions/refresh.svg?react';
 import ConnectivityIcon from './actions/connectivity.svg?react';
 import EditIcon from './actions/edit.svg?react';
@@ -29,11 +31,13 @@ export const settingsNavigationIcons = {
   general: GeneralIcon,
   models: ModelsIcon,
   agent: AgentIcon,
+  memory: MemoryIcon,
   browser: BrowserIcon,
   channels: ChannelsIcon,
   personalContext: PersonalContextIcon,
   experimental: ExperimentalIcon,
   appearance: AppearanceIcon,
+  systemPluginRecovery: RecoveryIcon,
 } as const satisfies Record<string, SettingsNavigationIcon>;
 
 export const settingsActionIcons = {

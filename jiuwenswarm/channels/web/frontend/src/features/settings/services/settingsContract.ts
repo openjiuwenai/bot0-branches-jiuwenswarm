@@ -1,8 +1,10 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
 import type { ModelEntry } from '../../../types';
 
 export const SETTINGS_CONFIG_CHANGED_EVENT = 'jiuwen:settings-config-changed';
 
-export type SettingsCategory = 'general' | 'models' | 'agent' | 'browser' | 'channels' | 'recommendation' | 'security' | 'experimental';
+export type SettingsCategory = 'memory' | 'general' | 'models' | 'agent' | 'browser' | 'channels' | 'recommendation' | 'security' | 'experimental';
 
 export type SettingsRequest = <T = unknown>(
   method: string,
@@ -30,6 +32,8 @@ export type ModelValidationPayload = {
   model: string;
   model_provider: string;
   reasoning_level: string | undefined;
+  /** Output limit from the unsaved draft; null explicitly tests the unlimited setting. */
+  max_tokens?: number | null;
   endpoint_profile?: string;
   /** 供应商预设标识（与模型条目同源，仅透传）。缺失表示自定义供应商；
    *  后端据此判断探测是否应回退持久化 endpoint_profile（与保存合并同口径）。 */
@@ -68,13 +72,13 @@ const yamlField = (
  * _CONFIG_YAML_KEYS and the Symphony-specific config specs.
  */
 export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
+  yamlField('memory_portal_enabled', 'memory', 'boolean', 'memory.builtin.jiuwen.portal.enabled'),
   envField('embed_api_base', 'models', 'text', 'EMBED_API_BASE'),
   envField('embed_api_key', 'models', 'text', 'EMBED_API_KEY'),
   envField('embed_model', 'models', 'text', 'EMBED_MODEL'),
 
   yamlField('skill_evolution', 'agent', 'boolean', 'react.evolution.skill_evolution'),
-  yamlField('skill_retrieval_enabled', 'agent', 'boolean', 'symphony.skill_retrieval.enabled'),
-  yamlField('skill_retrieval_index_enabled', 'agent', 'boolean', 'symphony.skill_retrieval.index.enabled'),
+  yamlField('skill_retrieval_enabled', 'agent', 'boolean', 'symphony.retrieval.enabled'),
   yamlField('ttse_enabled', 'agent', 'boolean', 'react.ttse.enabled'),
   envField('free_search_ddg_enabled', 'agent', 'boolean', 'FREE_SEARCH_DDG_ENABLED'),
   envField('free_search_bing_enabled', 'agent', 'boolean', 'FREE_SEARCH_BING_ENABLED'),
@@ -158,6 +162,7 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   ),
 
   yamlField('a2ui_enabled', 'experimental', 'boolean', 'a2ui.enabled'),
+  yamlField('rea_enabled', 'experimental', 'boolean', 'rea.enabled'),
   yamlField('rsi_enabled', 'experimental', 'boolean', 'rsi.enabled'),
   yamlField('cua_agent_enabled', 'experimental', 'boolean', 'react.subagents.cua_agent.enabled'),
   yamlField('trajectory_ui_enabled', 'experimental', 'boolean', 'trajectory_ui.enabled'),
@@ -165,6 +170,7 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   yamlField('trajectory_ui_diagnosis_enabled', 'experimental', 'boolean', 'trajectory_ui.diagnosis_enabled'),
   yamlField('team_organization_ui_enabled', 'experimental', 'boolean', 'experimental.team_organization_ui_enabled'),
   yamlField('comfyui_workflow_enabled', 'experimental', 'boolean', 'experimental.comfyui_workflow_enabled'),
+  yamlField('team_leader_goal_enabled', 'experimental', 'boolean', 'modes.team.jiuwen_team.leader.goal'),
   yamlField('team_scheduled_dispatch_enabled', 'experimental', 'boolean', 'modes.team.jiuwen_team.dispatch_mode'),
   yamlField(
     'team_task_verification_enabled',
@@ -184,9 +190,15 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
     'boolean',
     'modes.team.jiuwen_team.max_subtask_depth',
   ),
+  yamlField(
+    'team_code_todo_reminder_disabled',
+    'experimental',
+    'boolean',
+    'modes.team.jiuwen_team.disable_code_todo_reminder',
+  ),
   yamlField('task_full_duplex_enabled', 'experimental', 'boolean', 'experimental.task_full_duplex_enabled'),
   yamlField('task_asr_enabled', 'experimental', 'boolean', 'experimental.task_asr_enabled'),
-  yamlField('symphony_evolution_enabled', 'experimental', 'boolean', 'symphony.evolution.flow.enabled'),
+  yamlField('symphony_evolution_enabled', 'experimental', 'boolean', 'symphony.orchestration.experience.enabled'),
   envField('asr_api_base', 'experimental', 'text', 'ASR_API_BASE'),
   envField('asr_api_key', 'experimental', 'text', 'ASR_API_KEY'),
   envField('asr_model', 'experimental', 'text', 'ASR_MODEL_NAME'),
@@ -241,7 +253,8 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
 export const SETTINGS_CONFIG_FIELD_BY_KEY = new Map(SETTINGS_CONFIG_FIELDS.map((field) => [field.key, field] as const));
 
 export const SETTINGS_OTHER_PERSISTENCE = [
-  { id: 'language', method: 'locale.set_conf', persistence: 'config.yaml', path: 'preferred_language' },
+  // 个人版：写 config.yaml；企业版：Gateway 写 user_preference[user_id]（不写 yaml）。
+  { id: 'language', method: 'locale.set_conf', persistence: 'config.yaml | gateway.user_preference', path: 'preferred_language' },
   { id: 'models', method: 'models.replace_all', persistence: 'config.yaml', path: 'models.defaults' },
   {
     id: 'browser',
@@ -267,6 +280,7 @@ export const OPENAI_ACCOUNT_RPC = {
 } as const;
 
 export const OPEN_SOURCE_SETTINGS_REQUEST_METHODS = [
+  'memory.portal.open',
   'multimodal.models.list',
   'multimodal.models.get',
   'multimodal.models.upsert',
@@ -366,6 +380,7 @@ export function buildModelValidationPayload(model: ModelEntry): ModelValidationP
     model_provider: model.model_provider,
     reasoning_level: model.reasoning_level,
   };
+  if (model.max_tokens !== undefined) payload.max_tokens = model.max_tokens;
   if (model.endpoint_profile) payload.endpoint_profile = model.endpoint_profile;
   if (model.vendor_key) payload.vendor_key = model.vendor_key;
   return payload;

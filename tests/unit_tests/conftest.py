@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+import jiuwenswarm.common.paths as _paths
 import jiuwenswarm.common.utils as _utils
 
 
@@ -68,10 +69,11 @@ def _isolate_user_workspace(tmp_path_factory):
             Path(__file__).resolve().parents[2] / "jiuwenswarm/resources/config.yaml",
             config_dir / "config.yaml",
         )
-        mp.setattr(_utils, "_workspace_base_dir", data)
-        mp.setattr(_utils, "_initialized", False)
+        # 路径解析真身在 paths（utils 为门面再导出）：隔离其缓存全局
+        mp.setattr(_paths, "_workspace_base_dir", data)
+        mp.setattr(_paths, "_initialized", False)
         for name in ("_config_dir", "_workspace_dir", "_root_dir"):
-            mp.setattr(_utils, name, None)
+            mp.setattr(_paths, name, None)
         mp.setenv("JIUWENSWARM_CONFIG_DIR", str(config_dir))
         # A Gateway operation can resolve either package's cached config path.
         for name in ("agent_gateway.common.config", "jiuwenswarm.common.config"):
@@ -172,6 +174,46 @@ def pytest_runtest_setup(item) -> None:
     else:
         _utils.get_config_file = _REAL_GET_CONFIG_FILE
         _utils.get_agent_workspace_dir = _REAL_GET_AGENT_WORKSPACE_DIR
+
+
+# pytest-html 4.x only counts outcomes for rows that stay in the report.
+# We omit passed detail rows (keeps the HTML small) but restore the Passed
+# total in pytest_html_results_summary so the summary checkboxes stay accurate.
+_OMITTED_HTML_OUTCOMES = {"passed": 0, "xpassed": 0}
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_html_results_table_row(report, cells) -> None:
+    """Omit passed rows from pytest-html so large CI reports stay openable."""
+    if not report.passed:
+        return
+    if report.when == "call":
+        key = "xpassed" if hasattr(report, "wasxfail") else "passed"
+        _OMITTED_HTML_OUTCOMES[key] += 1
+    del cells[:]
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_html_results_table_html(report, data) -> None:
+    """Drop captured log bodies for passed tests (main contributor to HTML size)."""
+    if report.passed:
+        del data[:]
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_html_results_summary(prefix, summary, postfix, session) -> None:
+    """Put omitted Passed/XPassed counts back into the summary filter totals."""
+    report_data = None
+    for plugin in session.config.pluginmanager.get_plugins():
+        candidate = getattr(plugin, "_report", None)
+        if candidate is not None and hasattr(candidate, "outcomes"):
+            report_data = candidate
+            break
+    if report_data is None:
+        return
+    for key, count in _OMITTED_HTML_OUTCOMES.items():
+        if count:
+            report_data.outcomes[key]["value"] += count
 
 
 @pytest.fixture(scope="session")

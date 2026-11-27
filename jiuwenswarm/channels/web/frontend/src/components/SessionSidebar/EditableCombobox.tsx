@@ -1,7 +1,9 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   filterEditableComboboxOptions,
   resolveEditableComboboxCommit,
+  resolveEditableComboboxStrictCommit,
   type EditableComboboxOption,
 } from './editableComboboxModel';
 
@@ -10,6 +12,8 @@ interface EditableComboboxProps {
   disabled?: boolean;
   emptyText?: string;
   placeholder?: string;
+  /** 只允许提交现有选项；自由输入失焦后回退到当前选中项。 */
+  strictSelection?: boolean;
   onChange: (value: string) => void;
   options: EditableComboboxOption[];
   value: string;
@@ -22,12 +26,14 @@ const VIEWPORT_MARGIN = 8;
 export function EditableCombobox({
   ariaLabel,
   disabled = false,
-  emptyText = '没有匹配项',
+  emptyText,
   placeholder,
+  strictSelection = false,
   onChange,
   options,
   value,
 }: EditableComboboxProps) {
+  const { t } = useTranslation();
   const listboxId = useId();
   const selectedOption = options.find(option => option.value === value);
   const selectedLabel = selectedOption?.label ?? (value ? value : '');
@@ -93,7 +99,9 @@ export function EditableCombobox({
   };
 
   const commitInput = () => {
-    const committedValue = resolveEditableComboboxCommit(options, inputValue);
+    const committedValue = strictSelection
+      ? resolveEditableComboboxStrictCommit(options, inputValue)
+      : resolveEditableComboboxCommit(options, inputValue);
     setOpen(false);
     setActiveIndex(0);
     if (!committedValue || committedValue === value) {
@@ -109,8 +117,7 @@ export function EditableCombobox({
     setOpen(false);
     setInputValue(option.label);
     setActiveIndex(0);
-    // 显式点选始终通知父组件：自定义生效后 value 可能仍停在某项，
-    // 再点同一项时也需要触发切换回授权 Agent。
+    // 显式点选始终通知父组件：即使 value 仍停在某项，也允许重新触发切换。
     onChange(option.value);
   };
 
@@ -179,7 +186,7 @@ export function EditableCombobox({
         data-testid="session-sidebar-editable-combobox-toggle"
         type="button"
         className="editable-combobox__toggle"
-        aria-label={`${ariaLabel}选项`}
+        aria-label={t('sessionSidebar.comboboxOptions', { label: ariaLabel })}
         aria-expanded={open}
         disabled={disabled}
         onClick={() => {
@@ -221,7 +228,7 @@ export function EditableCombobox({
               </button>
             ))
           ) : (
-            <div className="editable-combobox__empty">{emptyText}</div>
+            <div className="editable-combobox__empty">{emptyText ?? t('common.noMatches')}</div>
           )}
         </div>
       )}

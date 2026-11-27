@@ -242,17 +242,43 @@ class TenantAgentPool:
 
     @asynccontextmanager
     async def tenant_scope(self, request: Any):
-        """绑定 TenantContext，yield 该租户的 AgentManager；退出时 reset 并续约 LRU."""
+        """绑定 TenantContext（含明文三元组），yield Manager；退出时 reset 并续约 LRU."""
+        from jiuwenswarm.enterprise.tenant.tenant_identity import extract_triple
+
         tenant_key = self.extract_tenant_key(request)
-        ctx = TenantContext.bind(tenant_key)
+        group_id, bot_id, user_id = extract_triple(request)
+        ctx = TenantContext.bind(
+            tenant_key, group_id=group_id, bot_id=bot_id, user_id=user_id
+        )
         try:
             manager = await self._ensure_agent_manager(tenant_key)
+            self.persist_agent_identity(tenant_key, request)
             try:
                 yield manager
             finally:
                 await self._agent_wrappers.touch_if_same(tenant_key, manager)
         finally:
             ctx.reset()
+
+    @staticmethod
+    def persist_agent_identity(tenant_key: str, request: Any) -> None:
+        """把本次请求携带的展示身份写入租户工作区（缺失则跳过）."""
+        from agent_gateway.common.request_identity import read_agent_identity
+        from jiuwenswarm.enterprise.tenant.agent_identity_store import (
+            persist_agent_identity,
+        )
+
+        identity = read_agent_identity(getattr(request, "metadata", None))
+        if not identity:
+            return
+        try:
+            persist_agent_identity(tenant_key, identity)
+        except Exception:  # noqa: BLE001 - 身份落盘不得影响对话主流程
+            logger.warning(
+                "[TenantAgentPool] persist agent identity failed: tenant_key=%s",
+                tenant_key,
+                exc_info=True,
+            )
 
     async def process_message(self, request: AgentRequest) -> AgentResponse:
         """处理非流式请求：进租户作用域后分发到对应 AgentManager.
