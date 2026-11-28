@@ -13,6 +13,10 @@ ProcessIdentity: TypeAlias = float | str
 _TICKS_PREFIX = "proc_start_ticks:"
 
 
+class LegacyProcessCreationTimeMismatch(RuntimeError):
+    """A validated wall-clock birth field differs from the OS observation."""
+
+
 def proc_start_ticks(pid: int, *, proc_root: Path = Path("/proc")) -> int | None:
     """Read field 22 without the global ``/proc/stat`` boot-time record."""
     try:
@@ -115,8 +119,10 @@ def validate_process_identity(
     identity = read_process_identity(pid, process=process)
     created, ticks = hello.get("process_created"), hello.get("process_start_ticks")
     started = hello.get("process_started")
-    if hello.get("protocol") == 2 and created is None and ticks is None:
-        raise RuntimeError("Worker protocol 2 HELLO requires a process identity")
+    protocol = hello.get("protocol")
+    requires_birth_identity = type(protocol) is int and protocol >= 2
+    if requires_birth_identity and created is None and ticks is None:
+        raise RuntimeError(f"Worker protocol {protocol} HELLO requires a process identity")
     if created is not None:
         invalid_type = isinstance(created, bool) or not isinstance(created, (int, float))
         if invalid_type:
@@ -157,6 +163,8 @@ def validate_process_identity(
             # Retain this observer's OS birth identity for lifecycle checks.
             return identity
     if created is not None and not process_identity_matches(pid, created, process=process):
+        if ticks is None and hello.get("process_started") is None:
+            raise LegacyProcessCreationTimeMismatch("Worker PID identity changed")
         raise RuntimeError("Worker PID identity changed")
     # Protocol 1 Workers omitted birth fields; retain their OS-validated identity.
     return identity

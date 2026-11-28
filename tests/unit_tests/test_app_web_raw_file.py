@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import sys
 import threading
-import types
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,13 +21,20 @@ from jiuwenswarm.agents.harness.common.tools.web_file_download import (
     WebFileDownloadManager,
 )
 
-bootstrap_module = types.ModuleType("jiuwenswarm.agents.harness.team.bootstrap")
-bootstrap_module.configure_agent_teams_home = lambda: None
-sys.modules.setdefault(bootstrap_module.__name__, bootstrap_module)
-
-from jiuwenswarm.channels.web.app_web import _SpaStaticHandler, _format_ws_diagnostics
+# Avoid Team bootstrap during this Web-only import without leaving an incomplete
+# module in sys.modules for later Team and visibility tests.
+with patch("jiuwenswarm.agents.harness.team.bootstrap.configure_agent_teams_home"):
+    from jiuwenswarm.channels.web.app_web import _SpaStaticHandler, _format_ws_diagnostics
 
 _PERSONAL_HOST_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads"
+
+
+@pytest.fixture(autouse=True)
+def _pin_personal_edition(monkeypatch: pytest.MonkeyPatch):
+    """CSP 沙箱头是个人版行为：企业版（JIUWENSWARM_EDITION=enterprise）不加
+    CSP。CI 环境可能携带企业版变量，这里固定为个人版语义以保证用例确定性
+    （!10678 UT FAILED 定位）。"""
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "community")
 
 
 def test_format_ws_diagnostics_forwards_parts_and_fields():

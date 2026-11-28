@@ -4,7 +4,7 @@ title: 应用市场分端展示契约
 type: S
 author: default
 author_email: default
-updated: 2026-11-26
+updated: 2026-11-27
 modules: [jiuwenswarm/channels/desktop/electron, jiuwenswarm/channels/web/frontend/src/components/AppMarketPanel]
 files: [jiuwenswarm/channels/desktop/electron/app_market_windows.cjs, jiuwenswarm/channels/web/frontend/src/components/AppMarketPanel/AppMarketPage.tsx, jiuwenswarm/channels/web/frontend/src/components/AppMarketPanel/index.tsx, jiuwenswarm/channels/web/frontend/src/components/AppMarketPanel/AppMarketAiRoles.tsx]
 ---
@@ -28,7 +28,7 @@ files: [jiuwenswarm/channels/desktop/electron/app_market_windows.cjs, jiuwenswar
 - 从已安装应用详情选择“打开／恢复应用”时，确认应用打开后再返回列表。等待期间保留详情，失败时提示并允许在详情页重试。
 - 已安装应用的描述首段作为卡片摘要。空行后的内容显示在详情页，支持 Markdown 段落、引用和 HTTPS 来源链接。
 
-- Web/Electron 应用卡片的“编辑”通过 `app_market.edit_session` 在应用项目下创建真实空会话并保存绑定。同应用在途编辑请求在客户端合并，Gateway 按应用串行化，失败重试沿用同一 `edit_token`。Gateway 通过既有 E2A 请求查询项目、创建和读取会话。草稿独立于导航激活初始化，仅在新会话尚无本地运行态时预填元信息和源码入口，不自动发送。离开市场会取消前端激活。再次独立点击创建新会话，已有编辑会话保留历史、模型和草稿。
+- Web/Electron 应用卡片的“编辑”通过 `app_market.edit_session` 在应用项目下创建真实空会话并保存绑定。同应用在途编辑请求在客户端合并，Gateway 按应用串行化，失败重试沿用同一 `edit_token`。Gateway 通过既有 E2A 请求查询项目、创建和读取会话。草稿独立于导航激活初始化，仅在新会话尚无本地运行态时预填元信息、源码入口和 `workswarm-app-builder` 技能引导，不自动发送。成功进入会话后，支持项目列表的侧栏切到会话所属工作模式、展开所属项目，并在侧栏可见时滚动到新会话。离开市场会取消前端激活。再次独立点击创建新会话，已有编辑会话保留历史、模型和草稿。
 - 重新发布保留每个编辑会话的应用绑定，删除应用保留会话。关闭预览页签仅移除本次展示关联。绑定会话标题栏在刷新后可通过 `app_market.editor_app` 按当前所有者及编辑会话查询预览所需的应用信息，应用未运行时先启动。切换市场标签页会隐藏当前预览并撤销尚在启动的自动展示，应用服务继续运行。实例结束后移除该实例的预览关联。
 - 编辑侧栏复用工具面板的放大、收起和关闭页签操作，仅补充应用资源读数与预览重载入口。Electron 页面在独立窗口/编辑侧栏间移动不导航、不复制 WebContents、不切换持久分区；主窗口退出或停止应用仍销毁原页面。
 
@@ -39,9 +39,7 @@ files: [jiuwenswarm/channels/desktop/electron/app_market_windows.cjs, jiuwenswar
 
 - 资源每 3 秒采样。Web 和 Electron 的运行卡片在版本号旁显示 WorkSwarm 服务端采集的应用进程树内存，分栏和页面未打开时也可显示。Electron 的应用窗口和编辑预览沿用页面渲染进程读数。服务采样用既有实例 token 与上下文文件名校验进程身份，支持后端重启后的存活应用。无法核实或采样失败时读数不可用，CPU 首次采样等待下一轮。
 
-- 市场顶部及绑定应用的编辑会话顶部显示整机 CPU 与内存百分比，应用窗口/预览继续显示自身占用。Electron 的本机读数与服务端应用内存分别刷新，服务端请求迟延或失败时，本机读数和告警继续更新。Web 使用同一次服务端采样，并按连接地址区分“服务端（本地连接）”与“服务器”，本地连接不保证未经过代理或转发，提示中说明该边界。整机采样独立于应用窗口数量，随资源订阅启动和停止。CPU 首轮未知，约 3 秒后取得增量，内存使用平台可用/可回收量估算，macOS 不将 file-backed 缓存计入占用。
-- 资源提醒在市场顶部及绑定应用的编辑会话顶部显示，不弹重复通知、不自动停止应用。CPU 或内存连续 3 个不同采样点达到 85% 后提示；两项均低于 75% 时清除。失效采样、退出订阅和超过 10 秒的采样间隔重置提醒状态；后台 RPC 和 Electron IPC 沿用既有资源读取入口。
-
-- 编辑会话整机读数与“打开应用预览”使用同一后端绑定判定，未绑定的普通会话不展示。关闭预览不移除会话顶部的整机读数；与预览自身读数共用前端资源订阅，不新增轮询。
+- 应用市场列表页头统一展示整机 CPU、内存百分比及资源提醒。应用窗口和预览显示各自的资源占用。Electron 的本机读数与服务端应用内存分别刷新，服务端请求迟延或失败时，本机读数和告警继续更新。Web 使用同一次服务端采样，并按连接地址区分“服务端（本地连接）”与“服务器”，本地连接不保证未经过代理或转发，提示中说明该边界。整机采样独立于应用窗口数量，随资源订阅启动和停止。CPU 首轮未知，约 3 秒后取得增量，内存使用平台可用/可回收量估算，macOS 不将 file-backed 缓存计入占用。
+- 整机资源提醒不弹重复通知、不自动停止应用。CPU 或内存连续 3 个不同采样点达到 85% 后提示；两项均低于 75% 时清除。失效采样、退出订阅和超过 10 秒的采样间隔重置提醒状态；后台 RPC 和 Electron IPC 沿用既有资源读取入口。
 
 - 整机 CPU 与内存百分比独立按数值变色：低于 50% 使用成功色、50% 至不足 85% 使用警示色、85% 及以上使用危险色；不可用使用灰色。只着色百分比数值，沿用主题语义变量，文字提醒仍遵循持续采样和恢复阈值。

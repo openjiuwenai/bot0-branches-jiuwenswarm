@@ -1,3 +1,4 @@
+import { humanMemberDeliveries, withArtifactReferences } from '../../features/humanMemberDeliveries';
 /**
  * ChatPanel 组件
  *
@@ -398,10 +399,26 @@ function ActiveTeamGroupEntry({
   const teamTasks = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamTasks ?? []);
   const teamMembers = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamMembers ?? []);
   const todos = useTodoStore((s) => s.runtimes[activeSessionId ?? '']?.todos ?? []);
+  useEffect(() => {
+    if (!activeSessionId || mode !== 'team') return;
+    const chat = useChatStore.getState();
+    const existing = new Set(chat.runtimes[activeSessionId]?.messages.map(m => m.id));
+    for (const message of humanMemberDeliveries(teamMemberExecutionEvents, teamMembers)) {
+      if (!existing.has(message.id)) chat.addMessage(activeSessionId, message);
+    }
+  }, [activeSessionId, mode, teamMemberExecutionEvents, teamMembers]);
   const activeTeamMessages = useMemo(
     () => getActiveTeamMessages(teamHistoryMessages, messages),
     [teamHistoryMessages, messages],
   );
+  useEffect(() => {
+    if (!activeSessionId || mode !== 'team') return;
+    const chat = useChatStore.getState();
+    for (const message of messages) {
+      const normalized = withArtifactReferences(message);
+      if (normalized !== message) chat.updateMessage(activeSessionId, message.id, normalized);
+    }
+  }, [activeSessionId, mode, messages]);
   const hasVisibleMembers = teamMembers.some(
     (m) => m.member_id && m.member_id !== 'user' && !isTeamLeaderMember(m.member_id),
   );
@@ -2299,7 +2316,12 @@ export const ChatPanel = React.memo(function ChatPanel({
                 <span>{sessionProjectName}</span>
               </div>
             )}
-            <WebUIHost slotId="conversation.header.title.after" sessionId={activeSessionId} layout="row" />
+            <WebUIHost
+              slotId="conversation.header.title.after"
+              sessionId={activeSessionId}
+              layout="row"
+              className="chat-panel-header__plugin-title"
+            />
           </div>
           <div className="chat-panel-header__actions" data-testid="chat-panel-header-actions">
             {diagnosisEntryAvailable && onToggleDiagnosis && (
@@ -2319,6 +2341,7 @@ export const ChatPanel = React.memo(function ChatPanel({
               slotId="conversation.header.actions"
               sessionId={activeSessionId}
               layout="row"
+              className="chat-panel-header__plugin-actions"
               instanceClassName="flex min-w-0 items-center gap-2"
               styles={pluginHeaderActionStyles}
             />

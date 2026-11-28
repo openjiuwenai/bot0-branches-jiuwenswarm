@@ -2,6 +2,20 @@
 
 A resident Worker keeps Runtime loaded across Front restarts for desktop and ordinary services. The application or service owner controls final shutdown. HarmonyOS defaults to `front_loopback`: its Worker exits when the Front disconnects and does not use resident endpoint election or reattachment. Both modes verify actual process exit at final shutdown.
 
+## Startup and configuration readiness
+
+Front prepares control-plane configuration reads first. The Web application dismisses its loading-config notification after `config.get` succeeds for the current connection and the configuration is applied. Model discovery and execution resources can continue preparing; configuration readiness does not imply Agent execution readiness. Reconnection refreshes the configuration, and a failed read exposes an error and retry action.
+
+After connection, users can open Add model and fill a draft while the existing model list and vendor catalog load. Saving still waits for both to preserve validation, identity, and conflict checks. Background results retain entered fields; initialization failures allow retrying or canceling the draft.
+
+Worker IPC uses v3. The Supervisor validates the HELLO protocol, process birth identity, build identity, and data directory before granting startup permission; old-protocol Workers are not reused directly. Protocol v2 and newer require a verifiable creation timestamp or process start counter. Safe SDK imports can start earlier, while configuration migration, Runtime resource construction, and execution remain gated by startup permission.
+
+Bounded `runtime_prewarm` is enabled by default for one configured profile. It creates no Session and sends no model request. Defaults are a 1-second idle delay, two attempts, and budgets of 10 seconds wall time, 5 seconds process CPU, and 256 MB RSS growth. Foreground activity prevents subsequent background steps. Synchronous imports cannot be forcibly preempted; CPU/RSS budgets are observations that stop subsequent work. Set `runtime_prewarm.enabled: false` to disable prewarm. Measure true cold starts with prewarm disabled and report them separately from product-default results.
+
+Enabling or disabling a Rail extension updates the SDK instances registered by the current Worker's session adapters across channels and projects. Each instance owns its Rail object, and the RPC acknowledges success after those updates complete. With no instance yet, only configuration is saved; future instances load the current setting without creating an Agent or Session for a configuration request. An instance update failure returns an error and can be retried; completed registrations remain idempotent.
+
+## Shutdown, upgrades, and recovery
+
 - In resident mode, a normal Front restart or Supervisor `stop()` detaches and preserves the Worker.
 - In HarmonyOS's default `front_loopback` mode, Supervisor `stop()` shuts down and reaps its attached Worker.
 - Final desktop exit and upgrade stop the Front, then explicitly drain the current deployment's Worker, including a reattached Worker.
@@ -14,6 +28,8 @@ Endpoints are scoped by installation, Python environment, data directory, and ru
 When a HarmonyOS sandbox denies access to global `/proc/stat`, the Worker and Supervisor can validate process identity using the start counter in `/proc/<pid>/stat`, transmitted separately from the creation timestamp. If neither source is readable, startup fails with a HELLO log containing the PID, stage, and traceback. Cleanup also refuses to terminate an unverified target based on its PID alone.
 
 Successful shutdown requires a successful acknowledgement and observed PID exit. Forced termination, missing acknowledgements, and negative acknowledgements report failure. Install helpers also require this update attempt's successful shutdown receipt before replacing backend files. Legacy peers without acknowledgement support use verified process exit as their compatibility condition.
+
+On macOS, both native desktop builds and wheel installations may observe clock drift when retiring an older Worker that reports only a wall-clock creation time. Shutdown may proceed over the existing Unix socket if the kernel reports the same peer PID and the usual deployment, user, executable, and socket checks pass.
 
 Instances sharing a data directory retain distinct endpoint and deployment identities through `JIUWENSWARM_RUNTIME_INSTANCE` (preferred) or `HOSTNAME`. Stop commands must retain that instance's environment. Historical Workers owned by another instance are left running.
 

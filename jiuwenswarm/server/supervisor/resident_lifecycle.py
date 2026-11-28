@@ -13,12 +13,15 @@ import psutil
 from filelock import FileLock, Timeout
 
 from jiuwenswarm.common.process_identity import (
+    LegacyProcessCreationTimeMismatch,
     ProcessIdentity,
     process_identity_matches,
     read_process_identity,
     validate_process_identity,
 )
+from jiuwenswarm.server.ipc.stream import StreamConnection
 from jiuwenswarm.server.supervisor.identity import data_scope, deployment_scope
+from jiuwenswarm.server.ipc.protocol import PROTOCOL_VERSION
 
 
 class WorkerShutdownIncomplete(RuntimeError):
@@ -54,11 +57,12 @@ def worker_process(
     *,
     allow_legacy: bool = False,
     expected_pid: int | None = None,
+    connected_peer_pid: int | None = None,
 ) -> tuple[psutil.Process, ProcessIdentity]:
     """Establish ownership from the OS as well as the peer's HELLO fields."""
     if not isinstance(hello, dict) or hello.get("kind") != "hello":
         raise RuntimeError("Worker lifecycle refused an unknown IPC protocol")
-    if type(hello.get("protocol")) is not int or hello.get("protocol") not in (1, 2):
+    if type(hello.get("protocol")) is not int or hello.get("protocol") not in (1, 2, PROTOCOL_VERSION):
         raise RuntimeError("Worker lifecycle refused an invalid IPC protocol version")
     legacy = hello.get("deployment_scope") is None
     if legacy and not allow_legacy:
@@ -77,7 +81,13 @@ def worker_process(
         raise RuntimeError("Worker lifecycle refused an invalid PID")
     try:
         process = psutil.Process(pid)
-        created = validate_process_identity(pid, hello, process=process)
+        try:
+            created = validate_process_identity(pid, hello, process=process)
+        except LegacyProcessCreationTimeMismatch:
+            if pid != connected_peer_pid:
+                raise
+            # Continue with the local OS birth identity, including for exit checks.
+            created = read_process_identity(pid, process=process)
         if process.username() != psutil.Process().username():
             raise RuntimeError("Worker lifecycle refused a different user")
         executable = os.path.normcase(str(Path(process.exe()).resolve()))
@@ -127,11 +137,28 @@ async def _wait_exit(process: psutil.Process, created: ProcessIdentity, deadline
 async def retire_worker(connection, hello: dict, socket_path: str, *, deadline: float,
                         allow_legacy: bool = False, expected_pid: int | None = None) -> dict:
     """Send shutdown, observe actual exit and refuse incomplete persistence."""
-    process, created = worker_process(hello, socket_path, allow_legacy=allow_legacy, expected_pid=expected_pid)
+    try:
+        process, created = worker_process(hello, socket_path, allow_legacy=allow_legacy, expected_pid=expected_pid)
+    except LegacyProcessCreationTimeMismatch:
+        if sys.platform != "darwin" or not isinstance(connection, StreamConnection):
+            raise
+        connected_peer_pid = await asyncio.wait_for(
+            connection.macos_unix_peer_pid(), max(.001, deadline - time.monotonic()),
+        )
+        if connected_peer_pid != hello["pid"]:
+            raise
+        process, created = worker_process(
+            hello, socket_path, allow_legacy=allow_legacy, expected_pid=expected_pid,
+            connected_peer_pid=connected_peer_pid,
+        )
     grace = deadline - min(1.0, max(0.0, deadline - time.monotonic()) / 5)
     outcome = None
     error = None
     try:
+        if hello.get("protocol") == PROTOCOL_VERSION:
+            from jiuwenswarm.server.ipc.startup import startup_acceptance
+
+            await asyncio.wait_for(connection.send(startup_acceptance(hello)), max(.001, grace - time.monotonic()))
         await asyncio.wait_for(connection.send({"kind": "shutdown"}), max(.001, grace - time.monotonic()))
         while time.monotonic() < grace:
             frame = await asyncio.wait_for(connection.recv(), max(.001, grace - time.monotonic()))

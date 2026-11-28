@@ -441,6 +441,28 @@ const frame = (root, revision = 1, scope = target) => ({
   target: scope, schema_version: 1, revision, mode: 'replace', root,
 });
 const events = { 'ui.click': { id: 'confirm', args: { source: 'toolbar' } } };
+
+for (const [slotId, limit] of [
+  ['conversation.header.title.after', 2],
+  ['conversation.header.actions', 3],
+]) {
+  test(`${slotId} renders at most ${limit} list instances`, async () => {
+    const base = { session_id: 'sess-1', slot_id: slotId, package_id: 'pkg.0', instance_key: 'main' };
+    const app = await setup({ component: 'Text', props: { value: '0' } }, base);
+    try {
+      for (let index = 1; index <= limit; index += 1) {
+        await act(async () => app.transport.injectRenderFrame(frame(
+          { component: 'Text', props: { value: String(index) } },
+          1,
+          { ...base, package_id: `pkg.${index}` },
+        )));
+      }
+      assert.equal(app.container.querySelectorAll('[data-testid="webui-host-instance"]').length, limit);
+    } finally {
+      await app.close();
+    }
+  });
+}
 async function click(element) {
   assert.ok(element, 'click target must exist');
   await act(async () => element.dispatchEvent(new window.MouseEvent('click', { bubbles: true })));
@@ -2560,6 +2582,103 @@ test('task navigation and its page mount without a session and retain their inst
   }
 });
 
+test('application menu navigation and page mount without a session and stay mounted across session switches', async () => {
+  const transport = createMockTransport();
+  const runtime = createWebUIRuntime({ transport, catalog: componentCatalog });
+  runtime.start();
+  const container = document.createElement('div');
+  document.body.append(container);
+  const root = createRoot(container);
+  function Harness({ sessionId }) {
+    const [page, setPage] = useState(null);
+    return createElement(
+      WebUIProvider,
+      { runtime, registry: componentRendererRegistry },
+      createElement(
+        WebUISlotProvider,
+        { sessionId, onOpenPage: setPage, activePage: page },
+        createElement(WebUINavigationHost, { slotId: 'application.menu' }),
+        page ? createElement(WebUIPageHost, { target: page }) : null,
+      ),
+    );
+  }
+  const render = async (sessionId) => act(async () => root.render(createElement(Harness, { sessionId })));
+  const menuTarget = {
+    scope: 'application',
+    slot_id: 'application.menu',
+    package_id: 'probe.slot-app-menu',
+    instance_key: 'menu-probe',
+  };
+  try {
+    await render(null);
+    const ready = transport.dispatches[0];
+    assert.equal(ready.event, 'ui.ready');
+    assert.equal(ready.target.scope, 'application');
+    assert.equal(ready.target.sessionId, '');
+    await act(async () =>
+      transport.injectRenderFrame(
+        frame(
+          {
+            component: 'Button',
+            props: { value: '菜单探针' },
+            events: { 'ui.click': { id: 'menu.open' } },
+          },
+          1,
+          menuTarget,
+        ),
+      ),
+    );
+    const entry = container.querySelector('[data-testid="webui-button"]');
+    assert.ok(entry);
+    assert.equal(entry.textContent, '菜单探针');
+
+    for (const sessionId of ['session-a', 'session-b', null, 'session-c']) {
+      await render(sessionId);
+      assert.equal(container.querySelector('[data-testid="webui-button"]'), entry);
+      assert.equal(transport.dispatches.filter((request) => request.event === 'ui.ready').length, 1);
+    }
+
+    await click(entry);
+    const pageReady = transport.dispatches.find((request) => request.target.slotId === 'application.menu.main');
+    assert.ok(pageReady);
+    assert.deepEqual(pageReady.target, {
+      scope: 'application',
+      sessionId: '',
+      slotId: 'application.menu.main',
+      packageId: menuTarget.package_id,
+      instanceKey: menuTarget.instance_key,
+    });
+    await act(async () =>
+      transport.injectRenderFrame(
+        frame(
+          {
+            component: 'Box',
+            children: [{ component: 'Text', props: { value: '菜单探针主页面' } }],
+          },
+          1,
+          { ...menuTarget, slot_id: 'application.menu.main' },
+        ),
+      ),
+    );
+    const pageText = container.querySelector('[data-testid="webui-text"]');
+    assert.ok(pageText);
+    assert.equal(pageText.textContent, '菜单探针主页面');
+
+    for (const sessionId of ['session-a', 'session-b', null]) {
+      await render(sessionId);
+      assert.equal(container.querySelector('[data-testid="webui-button"]'), entry);
+      assert.equal(container.querySelector('[data-testid="webui-text"]'), pageText);
+      assert.equal(transport.dispatches.filter((request) => request.event === 'ui.ready').length, 2);
+    }
+    assert.equal(runtime.getScopeSnapshot('', 'application.menu').instanceKeys.length, 1);
+    assert.equal(runtime.getScopeSnapshot('', 'application.menu.main').instanceKeys.length, 1);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    runtime.dispose();
+  }
+});
+
 test('WebUIEntryHost renders application.entry with Avatar and closes on clear frame', async () => {
   window.localStorage.removeItem('workswarm.webui.entry.visited');
   const transport = createMockTransport();
@@ -2815,16 +2934,55 @@ test('Dropdown renders plugin-composed labels and native popup width without ini
   } finally { await app.close(); }
 });
 
-test('application footer mounts multiple contributions without a session', async () => {
+test('application footer keeps three contributions without a session', async () => {
   const scope = { scope: 'application', slot_id: 'application.sidebar.footer', package_id: 'pkg.one', instance_key: 'main' };
   const app = await setup({ component: 'Text', props: { value: 'First' } }, scope);
   try {
-    await act(async () => app.transport.injectRenderFrame(frame({ component: 'Text', props: { value: 'Second' } }, 1,
-      { ...scope, package_id: 'pkg.two' })));
+    for (const [packageId, value] of [['pkg.two', 'Second'], ['pkg.three', 'Third']]) {
+      await act(async () => app.transport.injectRenderFrame(frame({ component: 'Text', props: { value } }, 1,
+        { ...scope, package_id: packageId })));
+    }
     assert.match(app.container.textContent, /First/);
     assert.match(app.container.textContent, /Second/);
+    assert.match(app.container.textContent, /Third/);
+    assert.equal(app.container.querySelectorAll('[data-testid="webui-host-instance"]').length, 3);
+    await act(async () => app.transport.injectRenderFrame(frame({ component: 'Text', props: { value: 'Fourth' } }, 1,
+      { ...scope, package_id: 'pkg.four' })));
+    assert.doesNotMatch(app.container.textContent, /Fourth/);
+    assert.equal(app.container.querySelectorAll('[data-testid="webui-host-instance"]').length, 3);
     assert.equal(app.transport.dispatches[0].target.scope, 'application');
     assert.equal(app.transport.dispatches[0].target.sessionId, '');
+    await act(async () => app.transport.injectClearFrame({ target: scope, revision: 2 }));
+    assert.doesNotMatch(app.container.textContent, /First/);
+    assert.match(app.container.textContent, /Second/);
+    assert.match(app.container.textContent, /Third/);
+    assert.match(app.container.textContent, /Fourth/, 'the next mounted contribution takes the freed slot');
+    assert.equal(app.container.querySelectorAll('[data-testid="webui-host-instance"]').length, 3);
+  } finally { await app.close(); }
+});
+
+test('footer errors do not hide delivered contributions and recovered errors update the slot', async () => {
+  const scope = { scope: 'application', slot_id: 'application.sidebar.footer', package_id: 'pkg.initial', instance_key: 'main' };
+  const failed = { ...scope, package_id: 'pkg.failed' };
+  const app = await setup({ component: 'Text', props: { value: 'Initial' } }, scope);
+  try {
+    await act(async () => app.transport.injectClearFrame({ target: scope, revision: 2 }));
+    await act(async () => app.transport.injectErrorFrame({
+      target: failed, revision: 0, code: 'SCHEMA_ERROR', message: 'bad tree',
+    }));
+    for (const [packageId, value] of [['pkg.one', 'One'], ['pkg.two', 'Two'], ['pkg.three', 'Three']]) {
+      await act(async () => app.transport.injectRenderFrame(frame({ component: 'Text', props: { value } }, 1,
+        { ...scope, package_id: packageId })));
+    }
+    assert.match(app.container.textContent, /One/);
+    assert.match(app.container.textContent, /Two/);
+    assert.match(app.container.textContent, /Three/);
+    assert.equal(app.container.querySelectorAll('[data-testid="webui-host-instance"]').length, 3);
+
+    await act(async () => app.transport.injectRenderFrame(frame({ component: 'Text', props: { value: 'Recovered' } }, 1,
+      failed)));
+    assert.match(app.container.textContent, /Recovered/);
+    assert.doesNotMatch(app.container.textContent, /Three/);
   } finally { await app.close(); }
 });
 
@@ -3331,6 +3489,123 @@ for (const operation of ['expand', 'select']) {
     }
   });
 }
+
+test('FileTree treats stale accepted receipt as success, clears stale error on new frame, and supports last-write-wins selection', async () => {
+  const selection = createComponentState({ selectedKey: null, expandedKeys: [] });
+  const makeTree = () => [
+    { key: 'file-a', title: 'A.md', path: 'A.md', kind: 'file' },
+    { key: 'file-b', title: 'B.md', path: 'B.md', kind: 'file' },
+  ];
+  const pending = [];
+  const onSelect = (key) => new Promise((resolve, reject) => { pending.push({ key, resolve, reject }); });
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(createElement(FileTree, {
+      treeData: makeTree(), selection, onSelect, onExpand: async () => ({ status: 'sent', receipt: { accepted: true } }),
+    })));
+    // 1. Stale result with accepted receipt (frame arrived before receipt) must not show error or roll back.
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="file-a"]'));
+    await act(async () => pending.shift().resolve({ status: 'stale', receipt: { accepted: true } }));
+    assert.equal(container.querySelector('[data-testid="webui-file-tree-message"]'), null);
+    assert.equal(selection.getSnapshot().selectedKey, 'file-a');
+
+    // 2. Last-write-wins: clicking file-b while file-a is in flight supersedes file-a without disabling the tree.
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="file-a"]'));
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="file-b"]'));
+    assert.equal(pending.length, 2);
+    const first = pending.shift();
+    const second = pending.shift();
+    await act(async () => first.resolve({ status: 'failed' }));
+    assert.equal(container.querySelector('[data-testid="webui-file-tree-message"]'), null, 'superseded request failure is ignored');
+    assert.equal(selection.getSnapshot().selectedKey, 'file-b');
+    await act(async () => second.resolve({ status: 'sent', receipt: { accepted: true } }));
+    assert.equal(selection.getSnapshot().selectedKey, 'file-b');
+
+    // 3. Stale result with unknown (null) receipt is treated as failed without rolling back newer frame state.
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="file-a"]'));
+    await act(async () => pending.shift().resolve({ status: 'stale', receipt: null }));
+    assert.ok(container.querySelector('[data-testid="webui-file-tree-message"]'));
+    assert.equal(selection.getSnapshot().selectedKey, 'file-a');
+
+    // 4. Thrown request rejects selection and shows error, then a new treeData frame clears the transient error.
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="file-a"]'));
+    await act(async () => pending.shift().reject(new Error('network')));
+    assert.ok(container.querySelector('[data-testid="webui-file-tree-message"]'));
+    assert.equal(selection.getSnapshot().selectedKey, 'file-a');
+    await act(async () => root.render(createElement(FileTree, {
+      treeData: makeTree(), selection, onSelect, onExpand: async () => ({ status: 'sent', receipt: { accepted: true } }),
+    })));
+    assert.equal(container.querySelector('[data-testid="webui-file-tree-message"]'), null);
+  } finally {
+    await act(async () => root.unmount()); container.remove();
+  }
+});
+
+test('FileTree concurrent directory expand retains pending sibling expansion across intermediate render frames', async () => {
+  const selection = createComponentState({ selectedKey: null, expandedKeys: [] });
+  const initialTree = () => [
+    { key: 'dir-a', title: 'DirA', path: 'dir-a', kind: 'directory', loaded: false },
+    { key: 'dir-b', title: 'DirB', path: 'dir-b', kind: 'directory', loaded: false },
+  ];
+  const treeWithALoaded = () => [
+    {
+      key: 'dir-a', title: 'DirA', path: 'dir-a', kind: 'directory', loaded: true,
+      children: [{ key: 'a-file', title: 'a.txt', path: 'dir-a/a.txt', kind: 'file' }],
+    },
+    { key: 'dir-b', title: 'DirB', path: 'dir-b', kind: 'directory', loaded: false },
+  ];
+  const pending = new Map();
+  const onExpand = (data) => new Promise((resolve) => { pending.set(data.key, resolve); });
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(createElement(FileTree, {
+      treeData: initialTree(), selection, onSelect: async () => ({ status: 'sent', receipt: { accepted: true } }), onExpand,
+    })));
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="dir-a"]'));
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="dir-b"]'));
+    assert.deepEqual(selection.getSnapshot().expandedKeys, ['dir-a', 'dir-b']);
+
+    // Frame with only dir-a loaded arrives while dir-b is still pending: dir-b must stay expanded.
+    await act(async () => root.render(createElement(FileTree, {
+      treeData: treeWithALoaded(), selection, onSelect: async () => ({ status: 'sent', receipt: { accepted: true } }), onExpand,
+    })));
+    assert.deepEqual(selection.getSnapshot().expandedKeys, ['dir-a', 'dir-b']);
+    await act(async () => pending.get('dir-a')({ status: 'stale', receipt: { accepted: true } }));
+    await act(async () => pending.get('dir-b')({ status: 'sent', receipt: { accepted: true } }));
+    assert.deepEqual(selection.getSnapshot().expandedKeys, ['dir-a', 'dir-b']);
+  } finally {
+    await act(async () => root.unmount()); container.remove();
+  }
+});
+
+test('FileTree concurrent directory expand rollback does not revert sibling expansion', async () => {
+  const selection = createComponentState({ selectedKey: null, expandedKeys: [] });
+  const treeData = [
+    { key: 'dir-a', title: 'DirA', path: 'dir-a', kind: 'directory', loaded: false },
+    { key: 'dir-b', title: 'DirB', path: 'dir-b', kind: 'directory', loaded: false },
+  ];
+  const pending = new Map();
+  const onExpand = (data) => new Promise((resolve) => { pending.set(data.key, resolve); });
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(createElement(FileTree, {
+      treeData, selection, onSelect: async () => ({ status: 'sent', receipt: { accepted: true } }), onExpand,
+    })));
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="dir-a"]'));
+    await click(container.querySelector('[data-testid="webui-file-tree-item"][data-variant="dir-b"]'));
+    assert.deepEqual(selection.getSnapshot().expandedKeys, ['dir-a', 'dir-b']);
+    await act(async () => pending.get('dir-a')({ status: 'sent', receipt: { accepted: false } }));
+    assert.deepEqual(selection.getSnapshot().expandedKeys, ['dir-b']);
+    assert.ok(container.querySelector('[data-testid="webui-file-tree-message"]'));
+    await act(async () => pending.get('dir-b')({ status: 'stale', receipt: { accepted: true } }));
+    assert.deepEqual(selection.getSnapshot().expandedKeys, ['dir-b']);
+  } finally {
+    await act(async () => root.unmount()); container.remove();
+  }
+});
 
 test('Dropdown with a non-preview Image trigger opens only its menu', async () => {
   const app = await setup({ component: 'Dropdown', props: { items: [{ key: 'one', label: 'One' }] }, events: { 'ui.select': events['ui.click'] },

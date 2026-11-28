@@ -31,7 +31,11 @@ from openjiuwen.core.runner import Runner
 from openjiuwen.core.common.logging import server_logger, team_logger
 from openjiuwen.core.session.agent_team import create_agent_team_session
 from openjiuwen.harness import DeepAgent
-from agent_gateway.common.mode_matrix import NEW_TEAM_DESIGN
+from agent_gateway.common.mode_matrix import (
+    NEW_TEAM_DESIGN,
+    base_mode_without_plan,
+    is_team_plan_mode,
+)
 from agent_gateway.common.session_message import with_cross_session_history_metadata
 from agent_gateway.common.cron_team_completion import (
     _cron_solo_harness_end_pending,
@@ -52,6 +56,8 @@ from jiuwenswarm.agents.harness.common.tools.session_messaging_toolkit import (
     session_messaging_route_context,
     with_session_messaging_route,
 )
+from jiuwenswarm.agents.harness.code.prompt.plan_approval import PLAN_MODE_EXITED_EVENT_TYPE
+from jiuwenswarm.agents.harness.code.rails.code_agent_mode_rail import exit_plan_result_succeeded
 from jiuwenswarm.common.log_preview import DEFAULT_PREVIEW_MAX_CHARS, preview_text
 from jiuwenswarm.common.utils import get_agent_skills_dir, mask_sensitive
 from jiuwenswarm.common.config import get_config, get_skill_evolution_enabled
@@ -73,9 +79,18 @@ from jiuwenswarm.server.runtime.session.session_history import (
     resolve_final_record_timestamp,
 )
 from jiuwenswarm.agents.harness.team.handlers.team_monitor_handler import TeamMonitorHandler
-from jiuwenswarm.server.utils.stream_utils import parse_stream_chunk
+from jiuwenswarm.server.utils.stream_utils import (
+    decode_stream_chunk as parse_stream_chunk,
+    normalize_occupancy_rate,
+)
 from jiuwenswarm.server.runtime.agent_adapter.user_turn import TEAM_USER_TURN_KEY, UserTurn
 from jiuwenswarm.common.schema.agent import AgentResponseChunk
+from jiuwenswarm.extensions_v2.event_types.context_usage import (
+    MODEL_USAGE_COUNTERS,
+    TEAM_LEADER_MODEL_USAGE_FIELD,
+    ContextUsageUpdate,
+    notify_context_usage,
+)
 from jiuwenswarm.runtime.session_input import SessionInputMode, resolve_session_input_mode
 from jiuwenswarm.server.runtime.agent_adapter.evolution_helpers import (
     EvolutionProgressStatus,
@@ -1264,6 +1279,15 @@ def _coerce_budget(value) -> int | None:
     return n if n > 0 else None
 
 
+def _cap_budget(user_budget, enterprise_budget) -> int | None:
+    """Cap a user budget by an enterprise upper bound (None = unbounded)."""
+    if user_budget is None:
+        return enterprise_budget
+    if enterprise_budget is None:
+        return user_budget
+    return min(user_budget, enterprise_budget)
+
+
 def _resolve_session_swarmflow_config(
     params: dict | None,
     config_base: dict,
@@ -1271,57 +1295,110 @@ def _resolve_session_swarmflow_config(
     session_id: str,
     project_dir: str | None = None,
 ) -> dict:
-    """Resolve session-level swarmflow config by priority:
+    """Resolve session-level swarmflow config.
 
-    request params > metadata persisted > config.yaml.
+    Priority for the user/session preference: request params > metadata
+    persisted > default (enterprise ``swarmflow.default_enabled``, else
+    ``config.yaml`` ``enable_swarmflow``). The enterprise policy is then
+    applied on top:
+
+    * ``swarmflow.allowed`` — capability gate; when forbidden the final
+      ``enable_swarmflow`` is forced off.
+    * ``swarmflow.swarmflow_budget`` — upper bound; the effective budget is
+      ``min(user, enterprise)``.
+    * ``swarmflow.max_workflows`` / ``agents_per_run`` / ``max_agents_total`` —
+      carried into ``spec.swarmflow_concurrency`` (engine-level L1/L2/L3);
+      keys absent from the policy are absent from the result, so team_manager
+      keeps the spec's own limits for them.
+
+    The result carries both the effective values (``enable_swarmflow`` /
+    ``swarmflow_budget`` — gate and cap applied) and the user intent
+    (``swarmflow_user_enable`` / ``swarmflow_user_budget`` — before the
+    policy), so persistence stores what the user chose and the enterprise
+    policy keeps being re-read on every resolution.
 
     ``swarmflow_worktree`` is not a client choice: it follows the project
     directory (selected → isolation armed, absent → withheld), so the
     worktree capability and the work context can never disagree.
     """
     team_cfg = ((config_base.get("modes") or {}).get("team") or {}).get("jiuwen_team") or {}
-    config_enabled = bool(team_cfg.get("enable_swarmflow", False))
-    config_budget_raw = team_cfg.get("swarmflow_budget")
-    config_budget = (
-        int(config_budget_raw)
-        if isinstance(config_budget_raw, (int, float)) and config_budget_raw > 0
-        else None
+    policy = team_cfg.get("swarmflow")
+    policy = policy if isinstance(policy, dict) else {}
+    allowed = bool(policy.get("allowed", True))
+    # Only an explicitly delivered ``default_enabled`` overrides config.yaml;
+    # a legacy advanced_config row (no swarmflow columns) leaves it unset.
+    default_enabled = (
+        bool(policy["default_enabled"]) if "default_enabled" in policy else None
     )
+    # Concurrency caps are carried through ONLY when the enterprise policy
+    # explicitly provides them: team_manager then keeps the spec's own limits
+    # (config.yaml ``swarmflow_concurrency`` assembled by config_loader) as the
+    # base instead of silently resetting a deployment-tuned cap to the engine
+    # defaults. A cap present but invalid (<= 0) reads as absent.
+    max_workflows = _coerce_budget(policy.get("max_workflows"))
+    agents_per_run = _coerce_budget(policy.get("agents_per_run"))
+    max_agents_total = _coerce_budget(policy.get("max_agents_total"))
+    enterprise_budget = _coerce_budget(policy.get("swarmflow_budget"))
+    # Clamp engine invariants among the provided caps; team_manager re-clamps
+    # the merged result against the spec's base limits. Clamp DOWN to the
+    # tighter cap: an enterprise max_agents_total is a hard ceiling (L1 must
+    # stay <= L3 for the engine invariant) and is never widened by a
+    # co-provided max_workflows.
+    if max_agents_total is not None:
+        if max_workflows is not None:
+            max_workflows = min(max_workflows, max_agents_total)
+        if agents_per_run is not None:
+            agents_per_run = max(1, min(agents_per_run, max_agents_total))
+
+    config_enabled = bool(team_cfg.get("enable_swarmflow", False))
+    config_budget = _coerce_budget(team_cfg.get("swarmflow_budget"))
     worktree_flag = bool(str(project_dir or "").strip())
 
     if params and params.get("enable_swarmflow") is not None:
-        result = {
-            "enable_swarmflow": bool(params.get("enable_swarmflow")),
-            "swarmflow_budget": _coerce_budget(params.get("swarmflow_budget")),
-            "swarmflow_worktree": worktree_flag,
-        }
-        logger.info(
-            "[TeamHelpers] swarmflow config (source=request params, session=%s): %s",
-            session_id, result,
-        )
-        return result
+        enable = bool(params.get("enable_swarmflow"))
+        budget = _coerce_budget(params.get("swarmflow_budget"))
+        source = "request params"
+    else:
+        persisted = restore_session_swarmflow_config(session_id)
+        if persisted is not None:
+            enable = bool(persisted.get("enable_swarmflow", False))
+            budget = _coerce_budget(persisted.get("swarmflow_budget"))
+            source = "metadata"
+        else:
+            enable = default_enabled if default_enabled is not None else config_enabled
+            budget = config_budget
+            source = "config.yaml"
 
-    persisted = restore_session_swarmflow_config(session_id)
-    if persisted is not None:
-        result = {
-            "enable_swarmflow": bool(persisted.get("enable_swarmflow", False)),
-            "swarmflow_budget": _coerce_budget(persisted.get("swarmflow_budget")),
-            "swarmflow_worktree": worktree_flag,
-        }
-        logger.info(
-            "[TeamHelpers] swarmflow config (source=metadata, session=%s): %s",
-            session_id, result,
-        )
-        return result
+    # User intent BEFORE enterprise policy: the persisted preference keeps what
+    # the user chose, so a later policy change (gate re-opened, cap raised or
+    # removed) re-resolves freely instead of staying pinned to the forced
+    # values of the round that happened to persist them.
+    user_enable = enable
+    user_budget = budget
+    # Enterprise capability gate: forbidden → force off.
+    if not allowed:
+        enable = False
+    # Enterprise budget upper bound.
+    budget = _cap_budget(budget, enterprise_budget)
 
     result = {
-        "enable_swarmflow": config_enabled,
-        "swarmflow_budget": config_budget,
+        "enable_swarmflow": enable,
+        "swarmflow_user_enable": user_enable,
+        "swarmflow_budget": budget,
+        "swarmflow_user_budget": user_budget,
+        "swarmflow_budget_cap": enterprise_budget,
         "swarmflow_worktree": worktree_flag,
+        "swarmflow_allowed": allowed,
     }
+    if max_workflows is not None:
+        result["swarmflow_max_workflows"] = max_workflows
+    if agents_per_run is not None:
+        result["swarmflow_agents_per_run"] = agents_per_run
+    if max_agents_total is not None:
+        result["swarmflow_max_agents_total"] = max_agents_total
     logger.info(
-        "[TeamHelpers] swarmflow config (source=config.yaml, session=%s): %s",
-        session_id, result,
+        "[TeamHelpers] swarmflow config (source=%s, session=%s): %s",
+        source, session_id, result,
     )
     return result
 
@@ -3220,6 +3297,15 @@ def _truncate_team_tool_result_event(parsed: dict[str, Any]) -> dict[str, Any]:
     return next_event
 
 
+def _is_successful_exit_plan_result(parsed: dict[str, Any]) -> bool:
+    """Return whether a tool result reports a completed plan-mode exit."""
+    return (
+        parsed.get("event_type") == "chat.tool_result"
+        and parsed.get("tool_name") == "exit_plan_mode"
+        and exit_plan_result_succeeded(parsed.get("result"))
+    )
+
+
 def _is_duplicate_ask_user_question(
     parsed: dict[str, Any],
     emitted_request_ids: set[str],
@@ -3240,6 +3326,22 @@ def _is_duplicate_ask_user_question(
         return True
     emitted_request_ids.add(request_id)
     return False
+
+
+def _sync_team_plan_exit(session_id: str) -> str | None:
+    """Persist the leader's plan exit without recording another user turn."""
+    metadata = get_session_metadata(session_id, enable_writeback=False)
+    mode = metadata.get("mode")
+    if not is_team_plan_mode(mode):
+        return None
+    normal_mode = base_mode_without_plan(mode)
+    update_session_metadata(
+        session_id=session_id,
+        mode=normal_mode,
+        touch_last_message_at=False,
+        sync_write=True,
+    )
+    return normal_mode
 
 
 def _quiet_round_status_payload(
@@ -4133,6 +4235,11 @@ async def _process_team_message_stream(
             query = f"Player input:\n{query}"
             turn = turn.with_text(query)
         group_input = None if (private_group_heartbeat or npc_team) else _group_chat_input(request, query)
+        if not private_group_heartbeat and not npc_team and isinstance(request_params, dict):
+            from jiuwenswarm.agents.harness.common.memory.plugin import persist_team_memory_selection
+
+            mode = (request.metadata or {}).get("mode") or request_params.get("mode") or "team"
+            persist_team_memory_selection(session_id, {**request_params, "mode": mode})
     except ValueError as exc:
         yield AgentResponseChunk(
             request_id=rid, channel_id=channel_id,
@@ -4821,7 +4928,18 @@ async def _process_team_message_stream(
             isinstance(params_obj, dict)
             and params_obj.get("enable_swarmflow") is not None
         ):
-            persist_session_swarmflow_config(session_id, swarmflow_config)
+            # 只落盘用户偏好（门禁/封顶之前的意图）+ 本次生效的门禁/上限快照；
+            # 并发等企业策略每次解析时从 advanced_config 重新读取，不作为会话
+            # 偏好持久化。enable_swarmflow / swarmflow_budget 存的是用户意图，
+            # 企业放开门禁或调高上限后旧会话重新解析即可跟随，不会被上一轮
+            # 强制出来的值钉死。swarmflow_allowed / swarmflow_budget_cap 是给
+            # 前端恢复路径展示/禁用入口、收紧预算用的快照。
+            persist_session_swarmflow_config(session_id, {
+                "enable_swarmflow": bool(swarmflow_config.get("swarmflow_user_enable", False)),
+                "swarmflow_budget": swarmflow_config.get("swarmflow_user_budget"),
+                "swarmflow_budget_cap": swarmflow_config.get("swarmflow_budget_cap"),
+                "swarmflow_allowed": bool(swarmflow_config.get("swarmflow_allowed", True)),
+            })
         if (
             isinstance(params_obj, dict)
             and _coerce_team_dispatch_mode(params_obj.get("team_dispatch_mode")) is not None
@@ -5811,6 +5929,114 @@ def _is_team_recovered_chunk(chunk: Any) -> bool:
     return isinstance(payload, dict) and payload.get("event_type") == "team.recovered"
 
 
+@dataclass(slots=True)
+class _TeamLeaderRoundUsage:
+    """Pair a leader's observed model-call counters and context by Core call ID."""
+
+    request_id: str = ""
+    reported: bool = False
+    contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    counters: dict[str, tuple[int, ...]] = field(default_factory=dict)
+
+    def _reset(self, request_id: str) -> None:
+        self.request_id = request_id
+        self.reported = False
+        self.contexts.clear()
+        self.counters.clear()
+
+    def observe(
+        self,
+        chunk: Any,
+        parsed: dict[str, Any] | None,
+        *,
+        session_id: str,
+        request_id: str,
+        leader_name: str | None,
+    ) -> None:
+        if not request_id:
+            return
+        if request_id != self.request_id:
+            self._reset(request_id)
+        if self.reported or not leader_name:
+            return
+        role = getattr(chunk, "role", None)
+        role_value = getattr(role, "value", role)
+        if str(role_value).strip().lower() != TeamRole.LEADER.value:
+            return
+        if getattr(chunk, "source_member", None) not in (None, "", leader_name):
+            return
+        if parsed is not None and parsed.get("event_type") == "context.usage":
+            self._observe_context(parsed, session_id, leader_name)
+        elif getattr(chunk, "type", None) == "llm_call_end":
+            payload = getattr(chunk, "payload", None)
+            usage = payload.get(TEAM_LEADER_MODEL_USAGE_FIELD) if isinstance(payload, dict) else None
+            if isinstance(usage, dict):
+                call_id = usage.get("request_id")
+                counts = tuple(usage.get(name) for name in MODEL_USAGE_COUNTERS)
+                if isinstance(call_id, str) and call_id.strip() and all(
+                    type(count) is int and count >= 0 for count in counts
+                ):
+                    self.counters.setdefault(call_id, counts)
+
+    def _observe_context(self, context: dict[str, Any], session_id: str, leader_name: str) -> None:
+        if context.get("phase") != "post_call" or context.get("session_id") != session_id:
+            return
+        if context.get("product_session_id") not in (None, "", session_id):
+            return
+        depth = context.get("depth", 0)
+        if context.get("member_name") not in (None, "", leader_name) or type(depth) is not int or depth != 0:
+            return
+        child_fields = ("parent_invocation_id", "delegation_id", "subagent_id")
+        if any(map(context.get, child_fields)) or context.get("mode") == "subagent":
+            return
+        call_id = context.get("request_id")
+        if not isinstance(context.get("context_window"), dict) or not isinstance(call_id, str) or not call_id.strip():
+            return
+        self.contexts[call_id] = {**context, "role": TeamRole.LEADER.value}
+
+    def finish(self, session_id: str, request_id: str) -> None:
+        if not request_id:
+            logger.warning("[TeamHelpers] cannot finish leader usage without a round request ID: %s", session_id)
+            return
+        if request_id != self.request_id:
+            self._reset(request_id)
+            return
+        if self.reported:
+            return
+        paired = [
+            (context, self.counters[call_id])
+            for call_id, context in self.contexts.items() if call_id in self.counters
+        ]
+        self.contexts.clear()
+        self.counters.clear()
+        if not paired:
+            return
+        self.reported = True
+        latest_context = paired[-1][0]
+        input_tokens, output_tokens, total_tokens, cache_tokens = (
+            sum(column) for column in zip(*(counts for _, counts in paired), strict=True)
+        )
+        window = latest_context["context_window"]
+        limit = window.get("limit_tokens")
+        rate = normalize_occupancy_rate(window.get("occupancy_rate"))
+        model = latest_context.get("model")
+        notify_context_usage(
+            ContextUsageUpdate(
+                session_id=session_id,
+                request_id=request_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cache_tokens=cache_tokens,
+                context_window_tokens=limit if type(limit) is int and limit > 0 else None,
+                usage_percent=rate * 100 if rate is not None else None,
+                model=model if isinstance(model, str) else None,
+            ),
+            context_usage=latest_context,
+            team_leader=True,
+        )
+
+
 async def _consume_stream_with_query(
     channel_id: str | None,
     session_id: str,
@@ -5849,6 +6075,8 @@ async def _consume_stream_with_query(
     npc_expected_speakers = {team_spec.leader.member_name, *npc_titles} if npc_team else set()
     npc_spoken: set[str] = set()
     npc_turn_id = str(round_request_id or "")
+    leader_name = getattr(getattr(team_spec, "leader", None), "member_name", None)
+    leader_usage = _TeamLeaderRoundUsage()
     lg: TeamStreamLogger | None = None
     stream_cancelled = False
     # History writer for frames that no waiter receives: the durable pipeline
@@ -5868,6 +6096,14 @@ async def _consume_stream_with_query(
         """Broadcast one event and persist it when no waiter received it."""
         nonlocal writer, npc_turn_id
         context = _ACTIVE_ROUND_HISTORY_CONTEXT.get(session_id)
+        if (
+            event.get("event_type") == "chat.processing_status"
+            and event.get("is_processing") is False and event.get("is_complete") is True
+        ):
+            try:
+                leader_usage.finish(session_id, context.request_id if context is not None else "")
+            except Exception:
+                logger.warning("[TeamHelpers] leader round usage unavailable", exc_info=True)
         if npc_team and event.get("event_type") in {"chat.final", "chat.processing_status"}:
             turn_id = context.request_id if context is not None else npc_turn_id
             if turn_id != npc_turn_id:
@@ -6164,7 +6400,17 @@ async def _consume_stream_with_query(
             # control events stay because _is_leader_output returns True.
             # NPC Team sessions need every member's final speech, so they skip
             # the teammate filter entirely.
-            parsed = await run_stream_parser(parse_stream_chunk, chunk)
+            parsed = await run_stream_parser(
+                parse_stream_chunk, chunk, projection_parent_session_id=session_id,
+            )
+            if getattr(chunk, "type", None) in ("context.usage", "llm_call_end"):
+                context = _ACTIVE_ROUND_HISTORY_CONTEXT.get(session_id)
+                leader_usage.observe(
+                    chunk, parsed, session_id=session_id, leader_name=leader_name,
+                    request_id=context.request_id if context is not None else "",
+                )
+                if parsed is not None:
+                    parsed.pop(TEAM_LEADER_MODEL_USAGE_FIELD, None)
             hide_teammate = (
                 _team_hide_teammate_enabled()
                 and not is_leader
@@ -6232,6 +6478,18 @@ async def _consume_stream_with_query(
                     parsed["role"] = TeamRole.LEADER.value
                 parsed = _truncate_team_tool_result_event(parsed)
                 parsed = _attach_team_leader_identity(parsed, team_leader_identity)
+                if is_leader and _is_successful_exit_plan_result(parsed):
+                    try:
+                        normal_mode = await asyncio.to_thread(_sync_team_plan_exit, session_id)
+                    except Exception:
+                        logger.warning("[TeamHelpers] Team plan exit sync failed: %s", session_id, exc_info=True)
+                    else:
+                        if normal_mode is not None:
+                            await _deliver({
+                                "event_type": PLAN_MODE_EXITED_EVENT_TYPE,
+                                "session_id": session_id,
+                                "mode": normal_mode,
+                            })
                 if parsed.get("event_type") == "team.runtime_ready":
                     ready_team_name = str(parsed.get("team_name") or team_spec.team_name)
                     activation_kind = str(parsed.get("activation_kind") or "").strip()
